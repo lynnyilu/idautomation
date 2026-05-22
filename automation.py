@@ -253,19 +253,41 @@ def parse_phones_file(path: Path) -> dict[str, dict]:
 
 # ── Waybill resolution ───────────────────────────────────────────────────────
 
+def _parse_tracking_parts(s: str) -> tuple[str, int, str]:
+    m = re.match(r"^([A-Za-z]*)(\d+)([A-Za-z]*)$", s.strip())
+    if not m:
+        raise ValueError(f"Cannot parse tracking number: {s!r}")
+    return m.group(1), int(m.group(2)), m.group(3)
+
+
 def resolve_waybill(tracking_num: str, phones_map: dict) -> tuple[str, dict]:
     """
-    Return (effective_waybill, phones_entry).
-    If tracking_num is not in phones_map but ends with 'E', try without it.
-    The effective waybill is what should be used for the Taobao search and API upload.
+    Return (canonical_waybill, phones_entry).
+    canonical_waybill is the exact key from phones.txt when a match exists
+    (with or without trailing E). Use it for search, API upload, and logging.
     """
-    if tracking_num in phones_map:
-        return tracking_num, phones_map[tracking_num]
-    if tracking_num.endswith("E"):
-        no_e = tracking_num[:-1]
-        if no_e in phones_map:
-            return no_e, phones_map[no_e]
+    for candidate in (tracking_num, tracking_num[:-1] if tracking_num.endswith("E") else tracking_num + "E"):
+        if candidate in phones_map:
+            return candidate, phones_map[candidate]
     return tracking_num, {}
+
+
+def phones_waybills_in_range(phones_map: dict, start: str, end: str) -> list[str]:
+    """Return phones.txt waybill keys whose numeric segment is within start..end."""
+    prefix, n_start, _ = _parse_tracking_parts(start)
+    prefix2, n_end, _ = _parse_tracking_parts(end)
+    if prefix != prefix2:
+        raise ValueError(f"Start and end have different prefix: {start!r} vs {end!r}")
+    if n_start > n_end:
+        raise ValueError(f"Start {start!r} is after end {end!r}")
+
+    matched = []
+    for wb in phones_map:
+        p, n, _ = _parse_tracking_parts(wb)
+        if p == prefix and n_start <= n <= n_end:
+            matched.append(wb)
+    matched.sort(key=lambda wb: _parse_tracking_parts(wb)[1])
+    return matched
 
 
 # ── Validity period parser ────────────────────────────────────────────────────
@@ -609,7 +631,7 @@ async def process_one(
     display_name = phones_entry.get("name", "?")
     mobile       = phones_entry.get("mobile", "")
     if effective_num != tracking_num:
-        logger.info(f"  waybill : {tracking_num} → {effective_num} (matched phones.txt without trailing E)")
+        logger.info(f"  waybill : {tracking_num} → {effective_num} (using phones.txt)")
 
     try:
         # 1 ── Search ────────────────────────────────────────────────────────
@@ -752,21 +774,24 @@ async def worker(ctx, queue: asyncio.Queue, err_log, results: list, phones_map: 
                 idx, total, num = queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
-            _, phones_entry = resolve_waybill(num, phones_map)
+            waybill, phones_entry = resolve_waybill(num, phones_map)
             display_name = phones_entry.get("name", "?")
-            logger.info(f"[{idx}/{total}]  {num}  ({display_name})")
+            if waybill != num:
+                logger.info(f"[{idx}/{total}]  {waybill}  ({display_name})  [input: {num}]")
+            else:
+                logger.info(f"[{idx}/{total}]  {waybill}  ({display_name})")
 
-            result, reason = await process_one(page, num, phones_map)
+            result, reason = await process_one(page, waybill, phones_map)
             if result is None:
                 logger.info(f"  retrying in 2 s…")
                 await human_sleep(1.5, 3.0)
-                result, reason = await process_one(page, num, phones_map)
+                result, reason = await process_one(page, waybill, phones_map)
                 if result is None:
                     reason = f"failed after retry: {reason}"
 
             # One log entry per waybill, written only on failure
             if result is not True:
-                write_error(err_log, num, display_name, reason)
+                write_error(err_log, waybill, display_name, reason)
 
             results.append(result is True)
             await human_sleep(0.4, 1.2)
@@ -787,19 +812,33 @@ async def main() -> None:
                         help="Last tracking number in range (required with --start)")
     args = parser.parse_args()
 
+    phones_map = parse_phones_file(PHONES_PATH)
+
     if args.start:
         if not args.end:
             parser.error("--end is required when --start is used")
         try:
-            numbers = generate_tracking_range(args.start, args.end)
+            numbers = phones_waybills_in_range(phones_map, args.start, args.end)
+            if numbers:
+                logger.info(
+                    f"Using {len(numbers)} waybill(s) from phones.txt "
+                    f"({numbers[0]} → {numbers[-1]})"
+                )
+            else:
+                numbers = generate_tracking_range(args.start, args.end)
+                logger.warning(
+                    "No phones.txt entries in range — using generated tracking numbers; "
+                    "upload/log will use phones.txt format only when a match exists"
+                )
         except ValueError as exc:
             parser.error(str(exc))
     else:
         xlsx_path = Path(args.xlsx) if args.xlsx else XLSX_PATH
         numbers = get_tracking_numbers(xlsx_path)
 
-    # Load name + mobile mapping from phones.txt
-    phones_map = parse_phones_file(PHONES_PATH)
+    numbers = list(dict.fromkeys(
+        resolve_waybill(num, phones_map)[0] for num in numbers
+    ))
 
     # Create output dirs
     Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
