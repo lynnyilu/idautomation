@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# Playwright
+playwright/.cache/
+
+# Chrome login session (cookies, local storage — do not commit)
+chrome_profile/
+
+# Run-specific / sensitive data (PII: names, mobiles, waybills)
+phones.txt
+testorders.xlsx
+*.xlsx
+
+# Downloaded ID images and run logs (if stored inside the repo)
+*.jpg
+*.jpeg
+*.png
+log_*.txt
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
