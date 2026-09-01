@@ -582,6 +582,23 @@ def write_error(err_log, tracking_num: str, name: str, reason: str) -> None:
     err_log.flush()
 
 
+def format_duplicate_name_summary(uploads: list[tuple[str, str]]) -> str:
+    """Build a summary of uploaded names that appear on more than one waybill."""
+    by_name: dict[str, list[str]] = {}
+    for waybill, name in uploads:
+        by_name.setdefault(name, []).append(waybill)
+    dups = [(name, wbs) for name, wbs in by_name.items() if len(wbs) > 1]
+    if not dups:
+        return "No duplicated names among uploaded waybills."
+    dups.sort(key=lambda item: (-len(item[1]), item[0]))
+    lines = ["Duplicated names:"]
+    for name, wbs in dups:
+        lines.append(f"  {name}  ×{len(wbs)}")
+        for wb in wbs:
+            lines.append(f"    {wb}")
+    return "\n".join(lines)
+
+
 # ── Balloon reveal helper ─────────────────────────────────────────────────────
 
 async def reveal_field(content, icon_selector: str, id_page, label: str) -> str:
@@ -621,9 +638,9 @@ async def process_one(
 ) -> tuple[bool | None, str]:
     """
     Returns (result, reason):
-        (True,  "")       — success
-        (False, reason)   — non-retryable skip (no id, already exists)
-        (None,  reason)   — retryable failure
+        (True,  uploaded_name) — success
+        (False, reason)        — non-retryable skip (no id, already exists)
+        (None,  reason)        — retryable failure
     Never writes to the error log — that is the worker's responsibility.
     """
     ctx = page.context
@@ -748,7 +765,7 @@ async def process_one(
             )
             if ok:
                 logger.info(f"  API     : uploaded OK")
-                return True, ""
+                return True, idcard_name
             # 535 = ID already exists — non-retryable
             non_retryable = "已存在" in (msg or "") or "535" in (msg or "")
             return (False if non_retryable else None), f"API upload failed: {msg}"
@@ -765,7 +782,10 @@ async def process_one(
 
 # ── Worker ────────────────────────────────────────────────────────────────────
 
-async def worker(ctx, queue: asyncio.Queue, err_log, results: list, phones_map: dict) -> None:
+async def worker(
+    ctx, queue: asyncio.Queue, err_log, results: list, phones_map: dict,
+    uploads: list[tuple[str, str]],
+) -> None:
     page = await ctx.new_page()
     page.set_default_timeout(PAGE_TIMEOUT)
     try:
@@ -790,7 +810,9 @@ async def worker(ctx, queue: asyncio.Queue, err_log, results: list, phones_map: 
                     reason = f"failed after retry: {reason}"
 
             # One log entry per waybill, written only on failure
-            if result is not True:
+            if result is True:
+                uploads.append((waybill, reason))
+            else:
                 write_error(err_log, waybill, display_name, reason)
 
             results.append(result is True)
@@ -889,12 +911,20 @@ async def main() -> None:
         logger.info(f"Starting {n_workers} parallel worker(s) for {len(numbers)} order(s)…")
 
         results: list[bool] = []
+        uploads: list[tuple[str, str]] = []
         with open(LOG_PATH, "a", encoding="utf-8") as err_log:
             err_log.write(f"\n=== Run started {datetime.now()} ===\n")
             await asyncio.gather(
-                *[asyncio.create_task(worker(ctx, queue, err_log, results, phones_map))
-                  for _ in range(n_workers)]
+                *[asyncio.create_task(
+                    worker(ctx, queue, err_log, results, phones_map, uploads)
+                ) for _ in range(n_workers)]
             )
+
+            summary = format_duplicate_name_summary(uploads)
+            for line in summary.splitlines():
+                logger.info(line)
+            err_log.write(summary + "\n")
+            err_log.flush()
 
         ok_count   = sum(results)
         fail_count = len(results) - ok_count
