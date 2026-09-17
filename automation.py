@@ -631,6 +631,51 @@ async def reveal_field(content, icon_selector: str, id_page, label: str) -> str:
     return value
 
 
+async def wait_for_search_result(
+    page, waybill: str, old_count: int, old_href: str | None
+) -> None:
+    """
+    The sold page is a SPA — clicking 搜索订单 does not navigate, so
+    wait_for_load_state('load') can return immediately while the default
+    order list is still showing.
+
+    Do not wait for the JR waybill in page text: the list usually shows
+    buyer name / courier tracking only, so that wait never completes.
+    Instead wait until the ID-link list has actually changed from the
+    pre-search snapshot (a unique waybill search should leave 0 or 1).
+    """
+    links = page.locator(SELECTORS["view_id_link"])
+    no_id = page.locator("text=请联系消费者完成实名认证")
+    deadline = time.monotonic() + PAGE_TIMEOUT / 1000
+    stable_since: float | None = None
+    last_seen: tuple[int, str | None] | None = None
+
+    while time.monotonic() < deadline:
+        if await no_id.count() > 0:
+            return
+
+        count = await links.count()
+        href = await links.first.get_attribute("href") if count else None
+        changed = count != old_count or href != old_href
+        snapshot = (count, href)
+
+        if count <= 1 and changed:
+            if last_seen != snapshot:
+                last_seen = snapshot
+                stable_since = time.monotonic()
+            elif stable_since is not None and time.monotonic() - stable_since >= 0.4:
+                return
+        else:
+            last_seen = None
+            stable_since = None
+
+        await asyncio.sleep(0.15)
+
+    raise PlaywrightTimeout(
+        f"Timeout {PAGE_TIMEOUT}ms exceeded waiting for search results ({waybill})"
+    )
+
+
 # ── Per-order workflow ────────────────────────────────────────────────────────
 
 async def process_one(
@@ -661,8 +706,12 @@ async def process_one(
         await human_sleep(0.1, 0.25)
         await page.type(SELECTORS["search_input"], effective_num, delay=random.randint(60, 140))
         await human_sleep(0.3, 0.7)
+        id_links = page.locator(SELECTORS["view_id_link"])
+        old_id_count = await id_links.count()
+        old_id_href = await id_links.first.get_attribute("href") if old_id_count else None
         await human_click(page.locator(SELECTORS["search_button"]).first, page)
         await page.wait_for_load_state("load", timeout=PAGE_TIMEOUT)
+        await wait_for_search_result(page, effective_num, old_id_count, old_id_href)
         await human_sleep(1.2, 2.5)
 
         # 2 ── Check results ─────────────────────────────────────────────────
