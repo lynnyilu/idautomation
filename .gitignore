@@ -31,6 +31,10 @@ log_*.txt
 name_index_cache.json
 name_index_cache.tmp
 
+# Website-upload history (count + last-used time per photo pair)
+photo_upload_history.json
+photo_upload_history.tmp
+
 # IDE / OS
 .vscode/
 .idea/

@@ -32,6 +32,7 @@ import os
 import logging
 import random
 import string
+import threading
 import time
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -114,6 +115,8 @@ CONCURRENCY     = 2
 # plus this many retries (different pairs); then log `no id - retried x times`.
 OLD_FOLDER_MIN_AGE_DAYS          = 10
 RANDOM_PLACEHOLDER_MAX_RETRIES   = 2
+PLACEHOLDER_MAX_NAME_LEN         = 3  # skip names like 欧阳春晓 (4+ chars)
+PLACEHOLDER_MIN_IDLE_DAYS        = 10  # skip pairs uploaded this recently
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -132,8 +135,10 @@ logger = logging.getLogger(__name__)
 _new_tab_lock = asyncio.Lock()
 _output_lock  = asyncio.Lock()
 _website_upload_lock = asyncio.Lock()  # serializes the auodexpress.com upload flow (single-tab for now)
+_disk_index_lock = threading.Lock()  # name-index cache + upload history on disk
 # waybill -> ID-page name used when saving today's photo pair (413 website fallback)
 _last_saved_id_names: dict[str, str] = {}
+_live_name_index: dict = {}
 
 
 # ── Human-like interaction helpers ────────────────────────────────────────────
@@ -412,6 +417,7 @@ async def get_output_paths_async(name: str) -> tuple[Path, Path]:
 
 _IMG_EXTS = {".jpg", ".jpeg", ".png"}
 NAME_INDEX_CACHE_PATH = _AUTOMATION_DIR / "name_index_cache.json"
+PHOTO_HISTORY_PATH = _AUTOMATION_DIR / "photo_upload_history.json"
 
 NameIndex = dict[str, list[tuple[Path, Path]]]
 
@@ -497,9 +503,18 @@ def build_name_index(root: str | Path = OUTPUT_DIR) -> NameIndex:
 
 
 def find_same_name_photo_pair(name: str, index: NameIndex) -> tuple[Path, Path] | None:
-    """Pick one random complete photo pair for `name` from a prebuilt index."""
-    pairs = index.get(name)
-    return random.choice(pairs) if pairs else None
+    """Pick one random complete photo pair for `name` from a prebuilt index.
+
+    Pairs whose files are gone are dropped from the persisted index and skipped.
+    """
+    pairs = list(index.get(name) or [])
+    existing: list[tuple[Path, Path]] = []
+    for front, back in pairs:
+        if _pair_files_exist(front, back):
+            existing.append((front, back))
+        else:
+            prune_missing_photo_pair(front, back)
+    return random.choice(existing) if existing else None
 
 
 def find_same_name_pair_in_folder(name: str, folder: Path) -> tuple[Path, Path] | None:
@@ -575,11 +590,161 @@ def _is_recent_folder(path: Path, days: int = OLD_FOLDER_MIN_AGE_DAYS) -> bool:
     return datetime.now() - created < timedelta(days=days)
 
 
+def _history_key(front_path: Path) -> str:
+    try:
+        rel = Path(front_path).resolve().relative_to(Path(OUTPUT_DIR).resolve())
+        return rel.as_posix()
+    except ValueError:
+        return Path(front_path).name
+
+
+class PhotoUploadHistory:
+    """Persisted per-pair website-upload counts and last-used timestamps."""
+
+    def __init__(self, data: dict | None = None):
+        self._data: dict[str, dict] = data if isinstance(data, dict) else {}
+
+    @classmethod
+    def load(cls) -> "PhotoUploadHistory":
+        try:
+            raw = json.loads(PHOTO_HISTORY_PATH.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError):
+            raw = {}
+        return cls(raw if isinstance(raw, dict) else {})
+
+    def save(self) -> None:
+        tmp = PHOTO_HISTORY_PATH.with_suffix(".tmp")
+        tmp.write_text(
+            json.dumps(self._data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        tmp.replace(PHOTO_HISTORY_PATH)
+
+    def is_recent(self, front_path: Path, days: int = PLACEHOLDER_MIN_IDLE_DAYS) -> bool:
+        rec = self._data.get(_history_key(front_path))
+        if not rec:
+            return False
+        raw = rec.get("last_uploaded") or ""
+        try:
+            last = datetime.fromisoformat(raw)
+        except ValueError:
+            return False
+        return datetime.now() - last < timedelta(days=days)
+
+    async def record(self, front_path: Path) -> None:
+        with _disk_index_lock:
+            key = _history_key(front_path)
+            rec = self._data.get(key) or {"count": 0, "last_uploaded": ""}
+            rec["count"] = int(rec.get("count") or 0) + 1
+            rec["last_uploaded"] = datetime.now().isoformat(timespec="seconds")
+            self._data[key] = rec
+            try:
+                self.save()
+            except OSError as exc:
+                logger.warning(f"Could not save photo upload history: {exc}")
+
+    def summary_line(self) -> str:
+        if not self._data:
+            return "Upload history: none yet"
+        key, rec = max(
+            self._data.items(),
+            key=lambda kv: (int(kv[1].get("count") or 0), kv[1].get("last_uploaded") or ""),
+        )
+        return (
+            f"Upload history: {len(self._data)} pair(s) tracked; "
+            f"most used: {key} ×{rec.get('count', 0)} "
+            f"(last {rec.get('last_uploaded', '?')})"
+        )
+
+
+_upload_history = PhotoUploadHistory()
+
+
+def load_upload_history() -> PhotoUploadHistory:
+    global _upload_history
+    _upload_history = PhotoUploadHistory.load()
+    return _upload_history
+
+
+def _pair_files_exist(front_path: Path, back_path: Path) -> bool:
+    return Path(front_path).is_file() and Path(back_path).is_file()
+
+
+def _same_file(a: Path, b: Path) -> bool:
+    try:
+        return Path(a).resolve() == Path(b).resolve()
+    except OSError:
+        return Path(a) == Path(b)
+
+
+def _prune_from_name_index_cache(front: Path, back: Path) -> bool:
+    cache = _load_name_index_cache()
+    changed = False
+    for folder_name, folder_pairs in list(cache.items()):
+        if not isinstance(folder_pairs, dict):
+            continue
+        for name, pairs in list(folder_pairs.items()):
+            kept = []
+            for item in pairs:
+                if not (isinstance(item, (list, tuple)) and len(item) == 2):
+                    continue
+                f, b = item
+                if _same_file(Path(f), front) or _same_file(Path(b), back):
+                    changed = True
+                    continue
+                kept.append([str(f), str(b)])
+            if kept:
+                folder_pairs[name] = kept
+            else:
+                del folder_pairs[name]
+                changed = True
+        if not folder_pairs:
+            del cache[folder_name]
+            changed = True
+    if changed:
+        try:
+            _save_name_index_cache(cache)
+        except OSError as exc:
+            logger.warning(f"Could not save name index cache: {exc}")
+    return changed
+
+
+def _prune_from_live_name_index(front: Path, back: Path) -> None:
+    for name, pairs in list(_live_name_index.items()):
+        kept = [
+            (f, b) for f, b in pairs
+            if not (_same_file(Path(f), front) or _same_file(Path(b), back))
+        ]
+        if len(kept) == len(pairs):
+            continue
+        if kept:
+            _live_name_index[name] = kept
+        else:
+            del _live_name_index[name]
+
+
+def prune_missing_photo_pair(front_path: Path, back_path: Path) -> None:
+    """Drop one gone pair from the persisted name index, live index, and history."""
+    front, back = Path(front_path), Path(back_path)
+    logger.info(f"  pruning missing photo pair from index: {_history_key(front)}")
+    with _disk_index_lock:
+        _prune_from_name_index_cache(front, back)
+        _prune_from_live_name_index(front, back)
+        key = _history_key(front)
+        if key in _upload_history._data:
+            del _upload_history._data[key]
+            try:
+                _upload_history.save()
+            except OSError as exc:
+                logger.warning(f"Could not save photo upload history: {exc}")
+
+
 def build_old_photo_pool(root: str | Path = OUTPUT_DIR) -> list[tuple[Path, Path]]:
     """
     Complete photo pairs eligible as random 'no id' placeholders:
     files sitting directly in OUTPUT_DIR, plus pairs inside subfolders whose
     Windows creation time is at least OLD_FOLDER_MIN_AGE_DAYS ago.
+    Buyer names longer than PLACEHOLDER_MAX_NAME_LEN characters are skipped.
 
     Call after build_name_index() so the on-disk cache is already fresh —
     old folders are read from that cache instead of being walked again.
@@ -589,22 +754,61 @@ def build_old_photo_pool(root: str | Path = OUTPUT_DIR) -> list[tuple[Path, Path
     if not root.is_dir():
         return pairs
 
-    for _name, file_pairs in _scan_folder_for_pairs(root).items():
-        pairs.extend((Path(f), Path(b)) for f, b in file_pairs)
+    def add_short_name_pairs(by_name: dict[str, list]) -> None:
+        # `name` is already split off the numeric suffix: 李小明.jpg / 李小明1.jpg
+        # both count as 李小明 (3 chars), so they stay eligible.
+        nonlocal skipped_recent
+        for name, file_pairs in by_name.items():
+            if len(name) > PLACEHOLDER_MAX_NAME_LEN:
+                continue
+            for f, b in file_pairs:
+                front, back = Path(f), Path(b)
+                if not _pair_files_exist(front, back):
+                    prune_missing_photo_pair(front, back)
+                    continue
+                if _upload_history.is_recent(front):
+                    skipped_recent += 1
+                    continue
+                pairs.append((front, back))
+
+    skipped_recent = 0
+    add_short_name_pairs(_scan_folder_for_pairs(root))
 
     cache = _load_name_index_cache()
     for folder_name, folder_pairs in cache.items():
         folder_path = root / folder_name
         if not folder_path.is_dir() or _is_recent_folder(folder_path):
             continue
-        for _name, file_pairs in folder_pairs.items():
-            pairs.extend((Path(f), Path(b)) for f, b in file_pairs)
+        add_short_name_pairs(folder_pairs)
+    if skipped_recent:
+        logger.info(
+            f"Placeholder pool skipped {skipped_recent} pair(s) used in the last "
+            f"{PLACEHOLDER_MIN_IDLE_DAYS} days"
+        )
     return pairs
 
 
 def _pair_buyer_name(front_path: Path) -> str:
     split = _split_name_suffix(front_path.stem)
     return split[0] if split else front_path.stem
+
+
+def _pair_source_folder(front_path: Path) -> str:
+    """Immediate subfolder under OUTPUT_DIR, or '' if the file sits in OUTPUT_DIR."""
+    try:
+        rel = Path(front_path).resolve().relative_to(Path(OUTPUT_DIR).resolve())
+    except ValueError:
+        return Path(front_path).parent.name
+    if len(rel.parts) <= 1:
+        return ""
+    return rel.parts[0]
+
+
+def _placeholder_upload_label(front_path: Path) -> str:
+    """e.g. '朱俊峰(2026-04-23)' or '朱俊峰' for a root-level file."""
+    name = _pair_buyer_name(front_path)
+    folder = _pair_source_folder(front_path)
+    return f"{name}({folder})" if folder else name
 
 
 def _pair_log_filename(front_path: Path) -> str:
@@ -644,6 +848,18 @@ class RandomPlaceholderPool:
                 msg += f": {error}"
             lines.append(msg)
         return lines
+
+
+def prepare_photo_lookups() -> tuple[NameIndex, RandomPlaceholderPool]:
+    global _live_name_index
+    load_upload_history()
+    logger.info(_upload_history.summary_line())
+    name_index = build_name_index()
+    _live_name_index = name_index
+    logger.info(f"Same-name index: {len(name_index)} name(s) with a usable photo pair")
+    placeholder_pool = RandomPlaceholderPool(build_old_photo_pool())
+    logger.info(f"Placeholder pool: {len(placeholder_pool)} old photo pair(s)")
+    return name_index, placeholder_pool
 
 
 # ── New-tab helpers ───────────────────────────────────────────────────────────
@@ -906,6 +1122,10 @@ async def upload_via_website(
     Drive the auodexpress.com "身份证上传" wizard end to end for one waybill.
     Runs one at a time (single tab) regardless of caller concurrency.
     """
+    if not _pair_files_exist(front_path, back_path):
+        prune_missing_photo_pair(front_path, back_path)
+        return False, "photo file missing"
+
     async with _website_upload_lock:
         page = await ctx.new_page()
         page.set_default_timeout(PAGE_TIMEOUT)
@@ -939,9 +1159,16 @@ async def upload_via_website(
             if not ok:
                 return False, f"submit step failed: {reason}"
 
+            try:
+                await _upload_history.record(front_path)
+            except Exception as exc:
+                logger.warning(f"Could not record photo upload history: {exc}")
             return True, ""
 
         except Exception as exc:
+            if not _pair_files_exist(front_path, back_path):
+                prune_missing_photo_pair(front_path, back_path)
+                return False, "photo file missing"
             return False, f"error: {str(exc)[:160]}"
         finally:
             await page.close()
@@ -968,9 +1195,9 @@ async def try_random_placeholder_upload(
             break
         attempts += 1
         front_path, back_path = pair
-        new_name = _pair_buyer_name(front_path)
+        label = _placeholder_upload_label(front_path)
         logger.info(
-            f"  {waybill}\t{original_name}\tno id, trying placeholder {new_name}"
+            f"  {waybill}\t{original_name}\tno id, trying placeholder {label}"
         )
         ok, up_reason = await upload_via_website(ctx, waybill, front_path, back_path)
         if ok:
@@ -978,7 +1205,7 @@ async def try_random_placeholder_upload(
                 err_log,
                 waybill,
                 original_name,
-                f"no id, uploaded {new_name} - to be replaced later",
+                f"no id, uploaded {label} - to be replaced later",
             )
             uploads.append((waybill, original_name))
             return True
@@ -1060,15 +1287,25 @@ async def try_website_upload_today_or_yesterday(
 
 # ── Error logging ─────────────────────────────────────────────────────────────
 
+def is_successful_upload_note(reason: str) -> bool:
+    """True for log reasons that mean a waybill did get an ID uploaded."""
+    if reason in ("same name match uploaded successfully", "found a same name match"):
+        return True
+    return reason.startswith("no id, uploaded ") and "to be replaced later" in reason
+
+
 def write_error(err_log, tracking_num: str, name: str, reason: str) -> None:
-    line = f"{tracking_num}\t{name}\t{reason}"
+    """Unsuccessful waybill — `**`-prefixed so it stands out from upload notes."""
+    tracking_num = tracking_num.lstrip("*").strip()
+    line = f"**{tracking_num}\t{name}\t{reason}"
     logger.warning(f"  SKIP  {line}")
     err_log.write(line + "\n")
     err_log.flush()
 
 
 def write_match_note(err_log, tracking_num: str, name: str, note: str) -> None:
-    """Informational log line for the same-name-match flow (not a skip)."""
+    """Informational / successful-upload log line (not a skip)."""
+    tracking_num = tracking_num.lstrip("*").strip()
     line = f"{tracking_num}\t{name}\t{note}"
     logger.info(f"  {line}")
     err_log.write(line + "\n")
@@ -1076,10 +1313,7 @@ def write_match_note(err_log, tracking_num: str, name: str, note: str) -> None:
 
 
 def write_match_failure(err_log, tracking_num: str, name: str) -> None:
-    line = f"**{tracking_num}\t{name}\tsame name match fail to upload"
-    logger.warning(f"  SKIP  {line}")
-    err_log.write(line + "\n")
-    err_log.flush()
+    write_error(err_log, tracking_num, name, "same name match fail to upload")
 
 
 def write_placeholder_failure_summary(err_log, pool: "RandomPlaceholderPool") -> None:
@@ -1089,8 +1323,9 @@ def write_placeholder_failure_summary(err_log, pool: "RandomPlaceholderPool") ->
         return
     logger.info("Placeholder upload errors:")
     for line in lines:
-        logger.info(f"  {line}")
-        err_log.write(line + "\n")
+        marked = line if line.startswith("**") else f"** {line}"
+        logger.warning(f"  SKIP  {marked}")
+        err_log.write(marked + "\n")
     err_log.flush()
 
 
@@ -1464,10 +1699,7 @@ async def run_from_log(log_path: Path) -> None:
             ],
         )
 
-        name_index = build_name_index()
-        logger.info(f"Same-name index: {len(name_index)} name(s) with a usable photo pair")
-        placeholder_pool = RandomPlaceholderPool(build_old_photo_pool())
-        logger.info(f"Placeholder pool: {len(placeholder_pool)} old photo pair(s)")
+        name_index, placeholder_pool = prepare_photo_lookups()
 
         uploads: list[tuple[str, str]] = []
         results: list[bool] = []
@@ -1475,7 +1707,10 @@ async def run_from_log(log_path: Path) -> None:
             err_log.write(f"\n=== Replay run started {datetime.now()}  (source: {log_path}) ===\n")
 
             for waybill, name, reason in other_entries:
-                write_match_note(err_log, waybill, name, reason)
+                if is_successful_upload_note(reason):
+                    write_match_note(err_log, waybill, name, reason)
+                else:
+                    write_error(err_log, waybill, name, reason)
 
             for idx, (waybill, name) in enumerate(no_id_entries, 1):
                 logger.info(f"[{idx}/{len(no_id_entries)}]  {waybill}  ({name})")
@@ -1606,10 +1841,7 @@ async def main() -> None:
         n_workers = min(CONCURRENCY, len(numbers))
         logger.info(f"Starting {n_workers} parallel worker(s) for {len(numbers)} order(s)…")
 
-        name_index = build_name_index()
-        logger.info(f"Same-name index: {len(name_index)} name(s) with a usable photo pair")
-        placeholder_pool = RandomPlaceholderPool(build_old_photo_pool())
-        logger.info(f"Placeholder pool: {len(placeholder_pool)} old photo pair(s)")
+        name_index, placeholder_pool = prepare_photo_lookups()
 
         results: list[bool] = []
         uploads: list[tuple[str, str]] = []

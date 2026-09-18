@@ -48,6 +48,8 @@ playwright install chromium
 | `CONCURRENCY` | `2` | How many Taobao orders are processed at the same time |
 | `OLD_FOLDER_MIN_AGE_DAYS` | `10` | Placeholder photos must come from a subfolder older than this, or from files sitting directly in `OUTPUT_DIR` |
 | `RANDOM_PLACEHOLDER_MAX_RETRIES` | `2` | Extra placeholder pairs to try after the first one fails (`no id - retried x times`) |
+| `PLACEHOLDER_MAX_NAME_LEN` | `3` | Random placeholder pairs whose filename name is longer than this (e.g. `欧阳春晓`) are skipped |
+| `PLACEHOLDER_MIN_IDLE_DAYS` | `10` | Random placeholder skips a pair if it was website-uploaded within this many days |
 
 WMS API credentials (`API_CONSIGNOR`, `API_TOKEN`) also live at the top of `automation.py`.
 
@@ -98,19 +100,21 @@ A timestamped log file is also written to `OUTPUT_DIR` (e.g. `log_20260302_09000
 
 ## Error log
 
-Every waybill that doesn't go through the normal WMS API upload gets exactly **one** tab-separated line, `<waybill>\t<name>\t<reason>` (the in-progress "found a same name match" / "trying placeholder" states are printed to the console for visibility but are not written to the file — only the final outcome is). After the duplicate-name summary, the log may also list placeholder files that failed during this run (`<filename> has been tried and reported error: …`); those extra lines are not waybill rows.
+Every waybill that doesn't go through the normal WMS API upload gets exactly **one** tab-separated line, `<waybill>\t<name>\t<reason>` (the in-progress "found a same name match" / "trying placeholder" states are printed to the console for visibility but are not written to the file — only the final outcome is).
+
+**Unsuccessful waybills** (no ID uploaded in the end — unhandled API/timeout errors, `no id` after placeholder retries, same-name or 413 website upload still failing, `请确认订单信息`, etc.) are prefixed with `**` so they stand out and are easy to grep. Successful fallback uploads (`same name match uploaded successfully`, `no id, uploaded … - to be replaced later`) are **not** prefixed. After the duplicate-name summary, the log may also list placeholder files that failed during this run (`**<filename> has been tried and reported error: …`); those extra lines are not waybill rows.
 
 | Reason | Meaning |
 |---|---|
-| `no id` | Buyer hasn't completed identity verification, no same-name photo match was found, and there was no eligible old pair left to try as a placeholder |
-| `no id - retried x times` | Same as above, but 1–3 random old pairs were tried (first attempt plus up to 2 retries) and all failed |
-| `no id, uploaded <name> - to be replaced later` | No same-name match; a random old pair (`<name>`) was uploaded as a placeholder |
-| `same name match uploaded successfully` | Buyer hasn't completed verification, but a same-name photo match was found and the website-upload fallback succeeded |
-| `**...same name match fail to upload` | Same as above, but the fallback upload failed at some step — `**`-prefixed so it's easy to grep for |
-| `请确认订单信息` | Order not found or status unclear |
-| `failed after retry: API upload failed: HTTP 413, …` | REST API rejected the images as too large, **and** the [website 413 fallback](#http-413-website-fallback) could not find today's/yesterday's photos or the website upload also failed. A successful 413 fallback writes **no** log line. |
+| `**…	no id` | Buyer hasn't completed identity verification, no same-name photo match was found, and there was no eligible old pair left to try as a placeholder |
+| `**…	no id - retried x times` | Same as above, but 1–3 random old pairs were tried (first attempt plus up to 2 retries) and all failed |
+| `no id, uploaded <name>(<folder>) - to be replaced later` | No same-name match; a random old pair (`<name>` from folder `<folder>`, e.g. `2026-04-23`) was uploaded as a placeholder (not `**`-prefixed) |
+| `same name match uploaded successfully` | Buyer hasn't completed verification, but a same-name photo match was found and the website-upload fallback succeeded (not `**`-prefixed) |
+| `**…	same name match fail to upload` | Same-name website upload failed — `**`-prefixed like every other unsuccessful waybill |
+| `**…	请确认订单信息` | Order not found or status unclear |
+| `**…	failed after retry: API upload failed: HTTP 413, …` | REST API rejected the images as too large, **and** the [website 413 fallback](#http-413-website-fallback) could not find today's/yesterday's photos or the website upload also failed. A successful 413 fallback writes **no** log line. |
 | `failed after retry: could not open ID viewer page` | ID viewer tab never opened after one retry. **Treated as `no id`** (same-name match, then random placeholder) — the log will show that flow's outcome, not this original text. |
-| `failed after retry: ...` | Any other unexpected error after one automatic retry (timeout, other HTTP errors, etc.) — logged as-is, no extra upload |
+| `**…	failed after retry: ...` | Any other unexpected error after one automatic retry (timeout, other HTTP errors, etc.) — logged as-is with the `**` prefix, no extra upload |
 
 ---
 
@@ -136,15 +140,25 @@ Searching all ~40k+ files under `OUTPUT_DIR` from scratch on every lookup doesn'
 - **Today's** subfolder is always rescanned each run, since it can still be actively growing.
 - Folders that no longer exist on disk are dropped from the cache automatically.
 - If you ever reorganize or delete old photos and need a full rebuild, just delete `name_index_cache.json` — it'll be rebuilt (scanning everything once) on the next run.
+- If a cached pair is missing on disk when the script tries to use it (or while building the placeholder pool), that **one** pair is removed from `name_index_cache.json` and `photo_upload_history.json`. The waybill is still logged as a failure the same as before. You do not need to delete the whole cache for a few missing files.
+
+### Photo upload history (`photo_upload_history.json`)
+
+Every successful website-wizard upload (same-name match, random placeholder, or HTTP 413 fallback) is recorded in `photo_upload_history.json` (next to `automation.py`, gitignored). Each front-file path stores:
+
+- `count` — how many times that pair has been uploaded through the wizard
+- `last_uploaded` — local timestamp of the most recent success
+
+On startup the console prints how many pairs are tracked and which file has been used the most. This history is **not** the same as `name_index_cache.json`: deleting photos does not rewrite history, and deleting the history file only resets counts (it does not rebuild the name index).
 
 ### Random placeholder fallback (`no id`, no name match)
 
 If the same-name lookup finds nothing (the case that used to log a plain `no id`), the script uploads a **random existing photo pair** as a temporary stand-in for that waybill, through the same auodexpress.com wizard:
 
 1. Eligible pairs are files sitting **directly** in `OUTPUT_DIR`, plus complete pairs inside any subfolder whose Windows creation time is **at least 10 days ago**. Folders created within the last 10 days (including today's dated folder) are skipped.
-2. Pick one pair at random. A pair that already succeeded or already failed earlier in this run is never reused.
-3. On success, log `<waybill>	<original name>	no id, uploaded <placeholder name> - to be replaced later`.
-4. On any error, **do not log that attempt yet** — try a different pair. First attempt plus **up to 2 retries** (3 pairs max). If they all fail, log `no id - retried x times` (`x` is how many extra attempts ran after the first). If the pool was empty and nothing was tried, log a plain `no id`.
+2. Pick one pair at random. Names longer than 3 characters (e.g. `欧阳春晓`) are never chosen. A pair uploaded through the website wizard in the **last 10 days** is never chosen. A pair that already succeeded or already failed earlier in this run is never reused.
+3. On success, log `<waybill>	<original name>	no id, uploaded <placeholder name>(<folder>) - to be replaced later`. The folder is the dated (or other) subfolder under `OUTPUT_DIR` the pair came from; omitted if the files sit directly in `OUTPUT_DIR`.
+4. On any error, **do not log that attempt yet** — try a different pair. First attempt plus **up to 2 retries** (3 pairs max). If they all fail, log `**…	no id - retried x times` (`x` is how many extra attempts ran after the first). If the pool was empty and nothing was tried, log `**…	no id`.
 5. At the **end of the whole run**, every pair that failed is listed once as `<filename> has been tried and reported error: <message>` (message included when the wizard/page gave one). Other error reasons (API, timeout, same-name upload fail, etc.) are unchanged.
 
 This also runs in `--from-log` mode, for every source line whose reason is exactly `no id` or `failed after retry: could not open ID viewer page`.
