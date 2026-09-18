@@ -9,6 +9,8 @@ uploads everything to the WMS API (api/Open/IdcardAdd).
 
 If a buyer never completed Taobao real-name verification ("no id"), the script
 tries a same-name photo pair first, then a random old pair as a placeholder.
+If the WMS API rejects photos with HTTP 413, the same files are retried through
+the public website wizard (today's folder, then yesterday's).
 
 Quick start
 -----------
@@ -56,6 +58,10 @@ UPLOAD_WEBSITE_URL = "https://www.auodexpress.com/user.html#/upload-card-id"
 # (ISO format — sorts correctly and avoids "18SEP" colliding across years)
 _TODAY_LABEL = datetime.now().strftime("%Y-%m-%d")
 OUTPUT_DAILY = Path(OUTPUT_DIR) / _TODAY_LABEL
+_YESTERDAY_LABEL = (
+    datetime.strptime(_TODAY_LABEL, "%Y-%m-%d") - timedelta(days=1)
+).strftime("%Y-%m-%d")
+OUTPUT_YESTERDAY = Path(OUTPUT_DIR) / _YESTERDAY_LABEL
 
 # ── WMS API credentials ───────────────────────────────────────────────────────
 API_BASE      = "http://open-api.auodexpress.com"
@@ -126,6 +132,8 @@ logger = logging.getLogger(__name__)
 _new_tab_lock = asyncio.Lock()
 _output_lock  = asyncio.Lock()
 _website_upload_lock = asyncio.Lock()  # serializes the auodexpress.com upload flow (single-tab for now)
+# waybill -> ID-page name used when saving today's photo pair (413 website fallback)
+_last_saved_id_names: dict[str, str] = {}
 
 
 # ── Human-like interaction helpers ────────────────────────────────────────────
@@ -492,6 +500,70 @@ def find_same_name_photo_pair(name: str, index: NameIndex) -> tuple[Path, Path] 
     """Pick one random complete photo pair for `name` from a prebuilt index."""
     pairs = index.get(name)
     return random.choice(pairs) if pairs else None
+
+
+def find_same_name_pair_in_folder(name: str, folder: Path) -> tuple[Path, Path] | None:
+    """Return one complete front/back pair for `name` in `folder`, if any.
+
+    Prefers the unnumbered pair (`张三.jpg` / `张三1.jpg`) that get_output_paths
+    writes; otherwise the first complete numbered pair.
+    """
+    if not name or name == "?" or not folder.is_dir():
+        return None
+    pairs = _scan_folder_for_pairs(folder).get(name) or []
+    if not pairs:
+        return None
+    preferred: list[tuple[Path, Path]] = []
+    others: list[tuple[Path, Path]] = []
+    for front, back in pairs:
+        front_p, back_p = Path(front), Path(back)
+        if _split_name_suffix(front_p.stem) == (name, 0):
+            preferred.append((front_p, back_p))
+        else:
+            others.append((front_p, back_p))
+    chosen = preferred or others
+    return chosen[0]
+
+
+def find_same_name_pair_today_or_yesterday(
+    *names: str,
+) -> tuple[tuple[Path, Path], str] | None:
+    """Look up a same-name pair in today's folder, then yesterday's only."""
+    seen: set[str] = set()
+    candidates: list[str] = []
+    for name in names:
+        if name and name != "?" and name not in seen:
+            seen.add(name)
+            candidates.append(name)
+    for label, folder in (
+        ("today", OUTPUT_DAILY),
+        ("yesterday", OUTPUT_YESTERDAY),
+    ):
+        for name in candidates:
+            pair = find_same_name_pair_in_folder(name, folder)
+            if pair:
+                return pair, label
+    return None
+
+
+def is_api_413_after_retry(reason: str) -> bool:
+    return (
+        reason.startswith("failed after retry: API upload failed:")
+        and "413" in reason
+    )
+
+
+ID_VIEWER_FAIL_AFTER_RETRY = "failed after retry: could not open ID viewer page"
+
+
+def should_run_no_id_fallback(reason: str) -> bool:
+    """True for a genuine 'no id', or an ID-viewer miss treated the same way.
+
+    Exact match only — reasons that merely start with "no id" (e.g.
+    "no id, uploaded 贺雨菲 - to be replaced later" or "no id - retried 2 times")
+    are carried through unchanged on --from-log.
+    """
+    return reason == "no id" or reason == ID_VIEWER_FAIL_AFTER_RETRY
 
 
 def _is_recent_folder(path: Path, days: int = OLD_FOLDER_MIN_AGE_DAYS) -> bool:
@@ -956,6 +1028,36 @@ async def handle_no_id(
     )
 
 
+async def try_website_upload_today_or_yesterday(
+    ctx, waybill: str, display_name: str
+) -> bool:
+    """
+    HTTP 413 fallback: the REST API rejected the payload, but the public
+    website wizard often accepts the same photos. Use today's same-name pair
+    if present, otherwise yesterday's only. One website attempt; the caller
+    must not write a log line on success.
+    """
+    saved_name = _last_saved_id_names.get(waybill, "")
+    found = find_same_name_pair_today_or_yesterday(saved_name, display_name)
+    if not found:
+        logger.info(
+            f"  {waybill}\t{display_name}\t413 fallback: no same-name pair in today/yesterday"
+        )
+        return False
+    (front_path, back_path), source = found
+    logger.info(
+        f"  {waybill}\t{display_name}\t413 fallback: uploading {front_path.name} via website ({source})"
+    )
+    ok, up_reason = await upload_via_website(ctx, waybill, front_path, back_path)
+    if ok:
+        logger.info(f"  {waybill}\t{display_name}\t413 fallback uploaded via website")
+        return True
+    logger.info(
+        f"  {waybill}\t{display_name}\t413 fallback website upload failed: {up_reason}"
+    )
+    return False
+
+
 # ── Error logging ─────────────────────────────────────────────────────────────
 
 def write_error(err_log, tracking_num: str, name: str, reason: str) -> None:
@@ -1210,6 +1312,9 @@ async def process_one(
             else:
                 return None, "back image not captured"
 
+            _last_saved_id_names[effective_num] = idcard_name
+            _last_saved_id_names[tracking_num] = idcard_name
+
             # 10 ── Upload to WMS API ─────────────────────────────────────────
             if not mobile:
                 return None, "no mobile in phones.txt"
@@ -1269,14 +1374,27 @@ async def worker(
                 if result is None:
                     reason = f"failed after retry: {reason}"
 
-            # "no id" fallback: same-name pair via the website wizard, or else
-            # a random old photo pair as a placeholder to be replaced later.
-            if result is False and reason == "no id":
+            # "no id" fallback (also used when the ID viewer tab never opened):
+            # same-name pair via the website wizard, or else a random old pair.
+            if should_run_no_id_fallback(reason):
                 ok = await handle_no_id(
                     ctx, waybill, display_name, name_index,
                     placeholder_pool, err_log, uploads,
                 )
                 results.append(ok)
+                await human_sleep(0.4, 1.2)
+                continue
+
+            # HTTP 413: REST API rejected the payload; website upload often works.
+            if is_api_413_after_retry(reason):
+                ok = await try_website_upload_today_or_yesterday(
+                    ctx, waybill, display_name
+                )
+                if ok:
+                    results.append(True)
+                else:
+                    write_error(err_log, waybill, display_name, reason)
+                    results.append(False)
                 await human_sleep(0.4, 1.2)
                 continue
 
@@ -1296,22 +1414,30 @@ async def worker(
 
 async def run_from_log(log_path: Path) -> None:
     """
-    Replay a previous run's log file: for every 'no id' entry, retry the
-    same-name-match website-upload flow and, if that still has nothing,
-    a random old-pair placeholder (no Taobao search at all, since a
-    normal run already tried and failed on these). Every other reason is
-    carried over unchanged into a new log file.
+    Replay a previous run's log file: retry 'no id' / ID-viewer-fail via
+    same-name then placeholder, and retry HTTP 413 lines via today's (then
+    yesterday's) same-name website upload. No Taobao search. Every other
+    reason is carried over unchanged into a new log file.
     """
     entries = parse_log_file(log_path)
     if not entries:
         logger.error(f"No parseable waybill/name/reason lines found in {log_path}")
         return
 
-    no_id_entries    = [(wb, name) for wb, name, reason in entries if reason == "no id"]
-    other_entries    = [(wb, name, reason) for wb, name, reason in entries if reason != "no id"]
+    no_id_entries = [
+        (wb, name) for wb, name, reason in entries if should_run_no_id_fallback(reason)
+    ]
+    http_413_entries = [
+        (wb, name, reason) for wb, name, reason in entries if is_api_413_after_retry(reason)
+    ]
+    other_entries = [
+        (wb, name, reason) for wb, name, reason in entries
+        if not should_run_no_id_fallback(reason) and not is_api_413_after_retry(reason)
+    ]
     logger.info(
         f"Loaded {len(entries)} entries from {log_path} — "
-        f"{len(no_id_entries)} 'no id' to retry via same-name / placeholder, "
+        f"{len(no_id_entries)} 'no id' / ID-viewer-fail, "
+        f"{len(http_413_entries)} HTTP 413, "
         f"{len(other_entries)} other entries carried over unchanged"
     )
 
@@ -1359,6 +1485,16 @@ async def run_from_log(log_path: Path) -> None:
                 results.append(ok)
                 await human_sleep(0.4, 1.2)
 
+            for idx, (waybill, name, reason) in enumerate(http_413_entries, 1):
+                logger.info(f"[413 {idx}/{len(http_413_entries)}]  {waybill}  ({name})")
+                ok = await try_website_upload_today_or_yesterday(ctx, waybill, name)
+                if ok:
+                    results.append(True)
+                else:
+                    write_error(err_log, waybill, name, reason)
+                    results.append(False)
+                await human_sleep(0.4, 1.2)
+
             summary = format_duplicate_name_summary(uploads)
             for line in summary.splitlines():
                 logger.info(line)
@@ -1383,8 +1519,9 @@ async def main() -> None:
     src.add_argument("--start", metavar="NUM",
                      help="First tracking number in a range, e.g. JR25135001E")
     src.add_argument("--from-log", metavar="FILE",
-                     help="Replay a previous run's log file: retry only 'no id' lines via the "
-                          "same-name-match / placeholder website upload, skipping Taobao entirely")
+                     help="Replay a previous run's log file: retry 'no id', "
+                          "'could not open ID viewer page', and HTTP 413 lines via "
+                          "website upload, skipping Taobao entirely")
     parser.add_argument("--end", metavar="NUM",
                         help="Last tracking number in range (required with --start)")
     args = parser.parse_args()

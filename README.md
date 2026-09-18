@@ -10,7 +10,7 @@ Given a list of waybills — from an Excel file, or a `--start`/`--end` range ma
 5. Saves them as `<name>.jpg` / `<name>1.jpg` in a dated output subfolder
 6. Uploads name, ID number, validity period, mobile, and both images to the WMS API (`api/Open/IdcardAdd`)
 
-If a buyer hasn't completed Taobao's real-name verification (`no id`), the script first tries to reuse a photo pair already on file for that exact name. If none exists, it uploads a random **old** photo pair as a temporary placeholder (to be replaced later) — see [Same-name-match fallback](#same-name-match-fallback-no-id) and [Random placeholder fallback](#random-placeholder-fallback-no-id-no-name-match).
+If a buyer hasn't completed Taobao's real-name verification (`no id`), the script first tries to reuse a photo pair already on file for that exact name. If none exists, it uploads a random **old** photo pair as a temporary placeholder (to be replaced later) — see [Same-name-match fallback](#same-name-match-fallback-no-id) and [Random placeholder fallback](#random-placeholder-fallback-no-id-no-name-match). If the WMS API returns **HTTP 413**, the photos just saved are retried through the website wizard instead — see [HTTP 413 website fallback](#http-413-website-fallback).
 
 ---
 
@@ -108,13 +108,17 @@ Every waybill that doesn't go through the normal WMS API upload gets exactly **o
 | `same name match uploaded successfully` | Buyer hasn't completed verification, but a same-name photo match was found and the website-upload fallback succeeded |
 | `**...same name match fail to upload` | Same as above, but the fallback upload failed at some step — `**`-prefixed so it's easy to grep for |
 | `请确认订单信息` | Order not found or status unclear |
-| `failed after retry: ...` | Unexpected error after one automatic retry (timeout, HTTP error, couldn't open ID viewer, etc.) |
+| `failed after retry: API upload failed: HTTP 413, …` | REST API rejected the images as too large, **and** the [website 413 fallback](#http-413-website-fallback) could not find today's/yesterday's photos or the website upload also failed. A successful 413 fallback writes **no** log line. |
+| `failed after retry: could not open ID viewer page` | ID viewer tab never opened after one retry. **Treated as `no id`** (same-name match, then random placeholder) — the log will show that flow's outcome, not this original text. |
+| `failed after retry: ...` | Any other unexpected error after one automatic retry (timeout, other HTTP errors, etc.) — logged as-is, no extra upload |
 
 ---
 
 ## Same-name-match fallback (`no id`)
 
-The WMS API (`IdcardAdd`) requires an ID **number**, which we only get by reading it off the Taobao verification page — if the buyer never completed verification, we have no ID number, so the API path is a dead end even if we had a photo. To get around this without OCR'ing the number ourselves (unreliable — watermarks on some scans obscure digits), the script instead drives auodexpress.com's own public ID-upload wizard, which does the OCR server-side:
+The WMS API (`IdcardAdd`) requires an ID **number**, which we only get by reading it off the Taobao verification page — if the buyer never completed verification, we have no ID number, so the API path is a dead end even if we had a photo. To get around this without OCR'ing the number ourselves (unreliable — watermarks on some scans obscure digits), the script instead drives auodexpress.com's own public ID-upload wizard, which does the OCR server-side.
+
+The same flow also runs when Taobao never opened the ID viewer (`failed after retry: could not open ID viewer page`), because that usually means there is no usable ID page either.
 
 1. Look up the buyer's exact name (from `phones.txt`) in the same-name photo index (see below) — every complete front/back photo pair filed under that name, across every dated subfolder.
 2. If **no** pair exists anywhere, fall through to the [random placeholder fallback](#random-placeholder-fallback-no-id-no-name-match) instead of giving up.
@@ -143,7 +147,19 @@ If the same-name lookup finds nothing (the case that used to log a plain `no id`
 4. On any error, **do not log that attempt yet** — try a different pair. First attempt plus **up to 2 retries** (3 pairs max). If they all fail, log `no id - retried x times` (`x` is how many extra attempts ran after the first). If the pool was empty and nothing was tried, log a plain `no id`.
 5. At the **end of the whole run**, every pair that failed is listed once as `<filename> has been tried and reported error: <message>` (message included when the wizard/page gave one). Other error reasons (API, timeout, same-name upload fail, etc.) are unchanged.
 
-This also runs in `--from-log` mode, for every source line whose reason is exactly `no id`.
+This also runs in `--from-log` mode, for every source line whose reason is exactly `no id` or `failed after retry: could not open ID viewer page`.
+
+### HTTP 413 website fallback
+
+The WMS REST API (`IdcardAdd`) sometimes rejects a photo payload with **HTTP 413** (request too large) and a non-JSON body. The public auodexpress.com wizard usually accepts the same files.
+
+This runs after the normal Taobao capture + API upload has already been retried once (when the script is about to log `failed after retry: API upload failed: HTTP 413, …`), and again in `--from-log` for those same log lines:
+
+1. Look for a complete same-name front/back pair in **today's** dated folder (`OUTPUT_DIR\YYYY-MM-DD\`, relative to when the script runs). The name used is the one the files were just saved under (ID-page name) when available, falling back to the `phones.txt` / log name.
+2. If nothing is there, look in **yesterday's** folder only — not older folders, and not the random placeholder pool.
+3. Upload that pair through the same website wizard as the `no id` fallbacks (not the REST API). **One attempt.**
+4. On success: write **nothing** to the error log (console still notes that the website upload worked).
+5. If no pair is found, or the website upload fails: log the original `failed after retry: API upload failed: HTTP 413, …` line unchanged.
 
 ### Replay mode (`--from-log`)
 
@@ -151,13 +167,13 @@ This also runs in `--from-log` mode, for every source line whose reason is exact
 python automation.py --from-log "C:\Users\Lynn\Documents\JJ\身份证\log_20260918_233507.txt"
 ```
 
-Re-processes only the `no id` lines from that log through the same-name-match flow above, then the random placeholder if there is still no name match — it never touches Taobao at all, since a normal run already tried and failed on those. Every other reason in the source log (API errors, timeouts, `could not open ID viewer page`, prior `same name match uploaded successfully` / `**...fail to upload`, `no id, uploaded … - to be replaced later`, and `no id - retried x times`) is carried through **unchanged** into a new, separate timestamped log file. This means feeding a log back through `--from-log` a second time is safe: only genuine still-unmatched `no id` entries get retried, previously matched or already-placeholder-tried ones are left alone. This mode exists mainly for testing/iterating on the website-upload flow without re-running an entire batch.
+Re-processes `no id` lines, `failed after retry: could not open ID viewer page` lines, and HTTP 413 lines from that log — it never touches Taobao at all, since a normal run already tried and failed on those. `no id` / ID-viewer-fail go through same-name match then the random placeholder; 413 lines use today's (then yesterday's) same-name website upload. Every other reason in the source log (other API errors, timeouts, prior `same name match uploaded successfully` / `**...fail to upload`, `no id, uploaded … - to be replaced later`, and `no id - retried x times`) is carried through **unchanged** into a new, separate timestamped log file. Feeding a log back through `--from-log` a second time is safe: only still-unmatched `no id` / ID-viewer-fail entries and still-failed 413 lines get retried. This mode exists mainly for testing/iterating on the website-upload flow without re-running an entire batch.
 
 ---
 
 ## How it works
 
-- **`CONCURRENCY` parallel workers** each keep their own Taobao search tab open and pull orders from a shared queue; the website-upload fallback (same-name match and random placeholder) is serialized behind all of them (single tab, see above)
+- **`CONCURRENCY` parallel workers** each keep their own Taobao search tab open and pull orders from a shared queue; the website-upload fallback (same-name match, random placeholder, and HTTP 413) is serialized behind all of them (single tab, see above)
 - Each order opens the ID viewer in a new tab, captures both images, then closes that tab
 - Images are captured via network response interception (primary) with `<img src>` fetch and screenshot as fallbacks
 - A minimum size check (20 KB) rejects placeholder/loading images before saving
