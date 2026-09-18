@@ -48,8 +48,9 @@ PHONES_PATH        = _AUTOMATION_DIR / "phones.txt"
 ORDER_SEARCH_URL   = "https://myseller.taobao.com/home.htm/trade-platform/tp/sold"
 UPLOAD_WEBSITE_URL = "https://www.auodexpress.com/user.html#/upload-card-id"
 
-# Daily output subfolder created once at startup, e.g. "22APR"
-_TODAY_LABEL = datetime.now().strftime("%d%b").upper()
+# Daily output subfolder created once at startup, e.g. "2026-09-18"
+# (ISO format — sorts correctly and avoids "18SEP" colliding across years)
+_TODAY_LABEL = datetime.now().strftime("%Y-%m-%d")
 OUTPUT_DAILY = Path(OUTPUT_DIR) / _TODAY_LABEL
 
 # ── WMS API credentials ───────────────────────────────────────────────────────

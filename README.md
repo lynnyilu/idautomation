@@ -81,7 +81,7 @@ Before each run, paste in this run's batch of waybill → buyer data (name, mobi
 
 ## Output
 
-Images are saved inside a dated subfolder of `OUTPUT_DIR` (e.g. `OUTPUT_DIR\18SEP\`):
+Images are saved inside a dated subfolder of `OUTPUT_DIR` (e.g. `OUTPUT_DIR\2026-09-18\`, ISO format so it sorts correctly across year boundaries):
 
 | File | Contents |
 |---|---|
