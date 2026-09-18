@@ -27,6 +27,10 @@ testorders.xlsx
 *.png
 log_*.txt
 
+# Same-name-match photo index cache (derived data, rebuilt automatically)
+name_index_cache.json
+name_index_cache.tmp
+
 # IDE / OS
 .vscode/
 .idea/

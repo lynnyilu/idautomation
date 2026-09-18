@@ -384,46 +384,102 @@ async def get_output_paths_async(name: str) -> tuple[Path, Path]:
 
 
 # ── Same-name-match lookup ────────────────────────────────────────────────────
+# A persisted, incrementally-updated index of name -> photo pairs, so a run
+# doesn't have to re-walk the entire (currently ~40k file) OUTPUT_DIR tree
+# every time. Photo folders are append-only in normal use: every dated
+# subfolder except *today's* (which can still be growing mid-run) is scanned
+# once and then trusted as-is on later runs. Delete the cache file to force
+# a full rebuild (e.g. after manually reorganizing/deleting photos).
 
 _IMG_EXTS = {".jpg", ".jpeg", ".png"}
+NAME_INDEX_CACHE_PATH = _AUTOMATION_DIR / "name_index_cache.json"
+
+NameIndex = dict[str, list[tuple[Path, Path]]]
 
 
-def find_same_name_photo_pairs(name: str, root: str | Path = OUTPUT_DIR) -> list[tuple[Path, Path]]:
+def _split_name_suffix(stem: str) -> tuple[str, int] | None:
+    """Split "张三12" -> ("张三", 12). Returns None if stem is all digits."""
+    i = len(stem)
+    while i > 0 and stem[i - 1].isdigit():
+        i -= 1
+    if i == 0:
+        return None
+    suffix_str = stem[i:]
+    return stem[:i], (int(suffix_str) if suffix_str else 0)
+
+
+def _scan_folder_for_pairs(folder: Path) -> dict[str, list[tuple[str, str]]]:
+    """Group every complete front/back photo pair in `folder` by buyer name."""
+    by_name_suffix: dict[str, dict[int, str]] = {}
+    for entry in os.scandir(folder):
+        if not entry.is_file():
+            continue
+        p = Path(entry.path)
+        if p.suffix.lower() not in _IMG_EXTS:
+            continue
+        split = _split_name_suffix(p.stem)
+        if split is None:
+            continue
+        name, suffix = split
+        by_name_suffix.setdefault(name, {})[suffix] = str(p)
+
+    result: dict[str, list[tuple[str, str]]] = {}
+    for name, by_suffix in by_name_suffix.items():
+        pairs = [
+            (by_suffix[s], by_suffix[s + 1])
+            for s in by_suffix
+            if s % 2 == 0 and (s + 1) in by_suffix
+        ]
+        if pairs:
+            result[name] = pairs
+    return result
+
+
+def _load_name_index_cache() -> dict[str, dict]:
+    try:
+        return json.loads(NAME_INDEX_CACHE_PATH.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_name_index_cache(cache: dict[str, dict]) -> None:
+    tmp = NAME_INDEX_CACHE_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(NAME_INDEX_CACHE_PATH)
+
+
+def build_name_index(root: str | Path = OUTPUT_DIR) -> NameIndex:
     """
-    Search every dated subfolder under `root` for complete front/back photo
-    pairs belonging to `name` (files named "<name>.ext" / "<name><digits>.ext",
-    matching the numbering convention from get_output_paths). Returns every
-    complete pair found, across all folders/dates.
+    Refresh the on-disk per-folder cache (scanning only new folders and
+    today's folder) and return the merged name -> [(front, back), ...] index.
     """
     root = Path(root)
-    pairs: list[tuple[Path, Path]] = []
+    cache = _load_name_index_cache()
     if not root.is_dir():
-        return pairs
+        return {}
 
-    for dirpath, _dirnames, filenames in os.walk(root):
-        by_suffix: dict[int, Path] = {}
-        for fname in filenames:
-            f = Path(dirpath) / fname
-            if f.suffix.lower() not in _IMG_EXTS:
-                continue
-            stem = f.stem
-            if stem == name:
-                suffix = 0
-            elif stem.startswith(name) and stem[len(name):].isdigit():
-                suffix = int(stem[len(name):])
-            else:
-                continue
-            by_suffix[suffix] = f
-        for s in by_suffix:
-            if s % 2 == 0 and (s + 1) in by_suffix:
-                pairs.append((by_suffix[s], by_suffix[s + 1]))
+    subfolders = {e.name: Path(e.path) for e in os.scandir(root) if e.is_dir()}
 
-    return pairs
+    for folder_name, folder_path in subfolders.items():
+        if folder_name in cache and folder_name != _TODAY_LABEL:
+            continue
+        cache[folder_name] = _scan_folder_for_pairs(folder_path)
+
+    for stale in set(cache) - set(subfolders):
+        del cache[stale]
+
+    _save_name_index_cache(cache)
+
+    merged: NameIndex = {}
+    for folder_pairs in cache.values():
+        for name, pairs in folder_pairs.items():
+            merged.setdefault(name, []).extend((Path(f), Path(b)) for f, b in pairs)
+    return merged
 
 
-def find_same_name_photo_pair(name: str, root: str | Path = OUTPUT_DIR) -> tuple[Path, Path] | None:
-    """Pick one random complete photo pair for `name`, or None if none exist."""
-    pairs = find_same_name_photo_pairs(name, root)
+def find_same_name_photo_pair(name: str, index: NameIndex) -> tuple[Path, Path] | None:
+    """Pick one random complete photo pair for `name` from a prebuilt index."""
+    pairs = index.get(name)
     return random.choice(pairs) if pairs else None
 
 
@@ -1003,7 +1059,7 @@ async def process_one(
 
 async def worker(
     ctx, queue: asyncio.Queue, err_log, results: list, phones_map: dict,
-    uploads: list[tuple[str, str]],
+    uploads: list[tuple[str, str]], name_index: NameIndex,
 ) -> None:
     page = await ctx.new_page()
     page.set_default_timeout(PAGE_TIMEOUT)
@@ -1031,9 +1087,9 @@ async def worker(
             # "no id" fallback: try to reuse an existing same-name photo pair
             # via the auodexpress.com upload wizard instead of just logging it.
             if result is False and reason == "no id" and display_name != "?":
-                pair = find_same_name_photo_pair(display_name)
+                pair = find_same_name_photo_pair(display_name, name_index)
                 if pair:
-                    write_match_note(err_log, waybill, display_name, "found a same name match")
+                    logger.info(f"  {waybill}\t{display_name}\tfound a same name match")
                     front_path, back_path = pair
                     ok, up_reason = await upload_via_website(ctx, waybill, front_path, back_path)
                     if ok:
@@ -1106,6 +1162,9 @@ async def run_from_log(log_path: Path) -> None:
             ],
         )
 
+        name_index = build_name_index()
+        logger.info(f"Same-name index: {len(name_index)} name(s) with a usable photo pair")
+
         uploads: list[tuple[str, str]] = []
         results: list[bool] = []
         with open(LOG_PATH, "a", encoding="utf-8") as err_log:
@@ -1121,13 +1180,13 @@ async def run_from_log(log_path: Path) -> None:
                     results.append(False)
                     continue
 
-                pair = find_same_name_photo_pair(name)
+                pair = find_same_name_photo_pair(name, name_index)
                 if not pair:
                     write_error(err_log, waybill, name, "no id")
                     results.append(False)
                     continue
 
-                write_match_note(err_log, waybill, name, "found a same name match")
+                logger.info(f"  {waybill}\t{name}\tfound a same name match")
                 front_path, back_path = pair
                 ok, up_reason = await upload_via_website(ctx, waybill, front_path, back_path)
                 if ok:
@@ -1249,13 +1308,16 @@ async def main() -> None:
         n_workers = min(CONCURRENCY, len(numbers))
         logger.info(f"Starting {n_workers} parallel worker(s) for {len(numbers)} order(s)…")
 
+        name_index = build_name_index()
+        logger.info(f"Same-name index: {len(name_index)} name(s) with a usable photo pair")
+
         results: list[bool] = []
         uploads: list[tuple[str, str]] = []
         with open(LOG_PATH, "a", encoding="utf-8") as err_log:
             err_log.write(f"\n=== Run started {datetime.now()} ===\n")
             await asyncio.gather(
                 *[asyncio.create_task(
-                    worker(ctx, queue, err_log, results, phones_map, uploads)
+                    worker(ctx, queue, err_log, results, phones_map, uploads, name_index)
                 ) for _ in range(n_workers)]
             )
 

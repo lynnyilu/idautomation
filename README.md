@@ -96,14 +96,13 @@ A timestamped log file is also written to `OUTPUT_DIR` (e.g. `log_20260302_09000
 
 ## Error log
 
-Every waybill that doesn't go through the normal WMS API upload gets one tab-separated line, `<waybill>\t<name>\t<reason>`:
+Every waybill that doesn't go through the normal WMS API upload gets exactly **one** tab-separated line, `<waybill>\t<name>\t<reason>` (the in-progress "found a same name match" state is printed to the console for visibility but is not written to the file — only the final outcome is):
 
 | Reason | Meaning |
 |---|---|
 | `no id` | Buyer hasn't completed identity verification, and no existing photo match was found either |
-| `found a same name match` | Buyer hasn't completed verification, but a same-name photo pair was found — the website-upload fallback is being attempted |
-| `same name match uploaded successfully` | The fallback upload above succeeded |
-| `**...same name match fail to upload` | The fallback upload above failed at some step — `**`-prefixed so it's easy to grep for |
+| `same name match uploaded successfully` | Buyer hasn't completed verification, but a same-name photo match was found and the website-upload fallback succeeded |
+| `**...same name match fail to upload` | Same as above, but the fallback upload failed at some step — `**`-prefixed so it's easy to grep for |
 | `请确认订单信息` | Order not found or status unclear |
 | `failed after retry: ...` | Unexpected error after one automatic retry (timeout, HTTP error, couldn't open ID viewer, etc.) |
 
@@ -113,13 +112,22 @@ Every waybill that doesn't go through the normal WMS API upload gets one tab-sep
 
 The WMS API (`IdcardAdd`) requires an ID **number**, which we only get by reading it off the Taobao verification page — if the buyer never completed verification, we have no ID number, so the API path is a dead end even if we had a photo. To get around this without OCR'ing the number ourselves (unreliable — watermarks on some scans obscure digits), the script instead drives auodexpress.com's own public ID-upload wizard, which does the OCR server-side:
 
-1. Search `OUTPUT_DIR` and all of its dated subfolders for a complete front/back photo pair filed under the buyer's exact name (from `phones.txt`).
+1. Look up the buyer's exact name (from `phones.txt`) in the same-name photo index (see below) — every complete front/back photo pair filed under that name, across every dated subfolder.
 2. If **no** pair exists anywhere, log a plain `no id` — nothing else to try.
-3. If one or more pairs exist, **pick one at random** (deliberate — spreads reuse across candidates rather than always resubmitting the same photo for a repeat name) and log `found a same name match`.
+3. If one or more pairs exist, **pick one at random** (deliberate — spreads reuse across candidates rather than always resubmitting the same photo for a repeat name). "found a same name match" is printed to the console at this point, but not written to the log file yet — see [Error log](#error-log).
 4. Upload that pair through `https://www.auodexpress.com/user.html#/upload-card-id`: upload front → upload back → click 开始识别身份证 (OCR) → fill in 运单号 with the waybill → click 确认提交.
 5. **One attempt only.** Any failure at any step (image rejected, OCR timeout/error, submit error) gives up on that waybill immediately and logs `**...same name match fail to upload` — no retry, no partial credit.
 
 This flow always runs **single-tab / sequential**, even while the normal Taobao workers run with `CONCURRENCY` in parallel — a deliberate scope decision to keep it easy to watch and debug while the flow is still being tuned, not a hard technical limit.
+
+### Same-name photo index (`name_index_cache.json`)
+
+Searching all ~40k+ files under `OUTPUT_DIR` from scratch on every lookup doesn't scale, so the name → photo-pairs index is cached on disk (`name_index_cache.json`, next to `automation.py`, gitignored) and built once at the start of every run:
+
+- Every dated subfolder is scanned **once**, ever — the cache treats past folders as immutable, which holds in normal use (photos only get added, never removed).
+- **Today's** subfolder is always rescanned each run, since it can still be actively growing.
+- Folders that no longer exist on disk are dropped from the cache automatically.
+- If you ever reorganize or delete old photos and need a full rebuild, just delete `name_index_cache.json` — it'll be rebuilt (scanning everything once) on the next run.
 
 ### Replay mode (`--from-log`)
 
@@ -127,7 +135,7 @@ This flow always runs **single-tab / sequential**, even while the normal Taobao 
 python automation.py --from-log <path to a previous run's log file>
 ```
 
-Re-processes only the `no id` lines from that log through the same-name-match flow above — it never touches Taobao at all, since a normal run already tried and failed on those. Every other reason in the source log (API errors, timeouts, `could not open ID viewer page`, etc.) is carried through **unchanged** into a new, separate timestamped log file, so nothing from the original run is lost. This mode exists mainly for testing/iterating on the website-upload flow without re-running an entire batch.
+Re-processes only the `no id` lines from that log through the same-name-match flow above — it never touches Taobao at all, since a normal run already tried and failed on those. Every other reason in the source log (API errors, timeouts, `could not open ID viewer page`, and — since only the final outcome is ever logged — any prior `same name match uploaded successfully` / `**...fail to upload` line) is carried through **unchanged** into a new, separate timestamped log file. This means feeding a log back through `--from-log` a second time is safe: only genuine still-unmatched `no id` entries get retried, previously matched ones are left alone. This mode exists mainly for testing/iterating on the website-upload flow without re-running an entire batch.
 
 ---
 
