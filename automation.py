@@ -46,6 +46,7 @@ OUTPUT_DIR         = r"C:\Users\Lynn\Documents\JJ\身份证"
 CHROME_PROFILE_DIR = _AUTOMATION_DIR / "chrome_profile"
 PHONES_PATH        = _AUTOMATION_DIR / "phones.txt"
 ORDER_SEARCH_URL   = "https://myseller.taobao.com/home.htm/trade-platform/tp/sold"
+UPLOAD_WEBSITE_URL = "https://www.auodexpress.com/user.html#/upload-card-id"
 
 # Daily output subfolder created once at startup, e.g. "22APR"
 _TODAY_LABEL = datetime.now().strftime("%d%b").upper()
@@ -79,6 +80,19 @@ SELECTORS = {
     "back_id_icon": "xpath=//div[contains(.,'查看正面') and contains(.,'查看反面')]//a[@rel='noreferrer'][2]",
 }
 
+# auodexpress.com "身份证上传" wizard — used for the same-name-match fallback upload.
+# All three steps live in the DOM at once (Element UI v-show), toggled via a "hidden" class.
+UPLOAD_SELECTORS = {
+    "front_input":   ".step1 input.el-upload__input",   # .nth(0)
+    "back_input":    ".step1 input.el-upload__input",   # .nth(1)
+    "ocr_button":    "button:has-text('开始识别身份证')",
+    "step2_visible": ".step2:not(.hidden)",
+    "waybill_input": ".step2 form input.el-input__inner:not([disabled])",
+    "submit_button": ".step2 button:has-text('确认提交')",
+    "step3_visible": ".step3:not(.hidden)",
+    "error_toast":   ".el-message--error, .el-message--warning",
+}
+
 # Timeouts (milliseconds)
 PAGE_TIMEOUT    = 30_000
 ELEMENT_TIMEOUT = 15_000
@@ -100,6 +114,7 @@ logger = logging.getLogger(__name__)
 
 _new_tab_lock = asyncio.Lock()
 _output_lock  = asyncio.Lock()
+_website_upload_lock = asyncio.Lock()  # serializes the auodexpress.com upload flow (single-tab for now)
 
 
 # ── Human-like interaction helpers ────────────────────────────────────────────
@@ -110,6 +125,7 @@ async def human_sleep(min_s: float, max_s: float) -> None:
 
 async def human_click(locator, page, timeout: int = 15_000) -> None:
     await locator.wait_for(state="visible", timeout=timeout)
+    await locator.scroll_into_view_if_needed(timeout=timeout)
     box = await locator.bounding_box()
     if box:
         tx = box["x"] + box["width"]  * random.uniform(0.3, 0.7)
@@ -251,6 +267,28 @@ def parse_phones_file(path: Path) -> dict[str, dict]:
     return mapping
 
 
+# ── Log-file replay parser ────────────────────────────────────────────────────
+
+def parse_log_file(path: Path) -> list[tuple[str, str, str]]:
+    """
+    Parse a previous run's log file into (waybill, name, reason) tuples.
+    Skips the "=== Run started ===" header and the duplicate-name summary
+    footer — only tab-separated waybill/name/reason lines are kept.
+    """
+    entries: list[tuple[str, str, str]] = []
+    text = Path(path).read_text(encoding="utf-8")
+    for line in text.splitlines():
+        parts = line.split("\t")
+        if len(parts) != 3:
+            continue
+        waybill, name, reason = (p.strip() for p in parts)
+        waybill = waybill.lstrip("*")
+        if not re.match(r"^JR\d+E?$", waybill):
+            continue
+        entries.append((waybill, name, reason))
+    return entries
+
+
 # ── Waybill resolution ───────────────────────────────────────────────────────
 
 def _parse_tracking_parts(s: str) -> tuple[str, int, str]:
@@ -343,6 +381,50 @@ def get_output_paths(name: str) -> tuple[Path, Path]:
 async def get_output_paths_async(name: str) -> tuple[Path, Path]:
     async with _output_lock:
         return get_output_paths(name)
+
+
+# ── Same-name-match lookup ────────────────────────────────────────────────────
+
+_IMG_EXTS = {".jpg", ".jpeg", ".png"}
+
+
+def find_same_name_photo_pairs(name: str, root: str | Path = OUTPUT_DIR) -> list[tuple[Path, Path]]:
+    """
+    Search every dated subfolder under `root` for complete front/back photo
+    pairs belonging to `name` (files named "<name>.ext" / "<name><digits>.ext",
+    matching the numbering convention from get_output_paths). Returns every
+    complete pair found, across all folders/dates.
+    """
+    root = Path(root)
+    pairs: list[tuple[Path, Path]] = []
+    if not root.is_dir():
+        return pairs
+
+    for dirpath, _dirnames, filenames in os.walk(root):
+        by_suffix: dict[int, Path] = {}
+        for fname in filenames:
+            f = Path(dirpath) / fname
+            if f.suffix.lower() not in _IMG_EXTS:
+                continue
+            stem = f.stem
+            if stem == name:
+                suffix = 0
+            elif stem.startswith(name) and stem[len(name):].isdigit():
+                suffix = int(stem[len(name):])
+            else:
+                continue
+            by_suffix[suffix] = f
+        for s in by_suffix:
+            if s % 2 == 0 and (s + 1) in by_suffix:
+                pairs.append((by_suffix[s], by_suffix[s + 1]))
+
+    return pairs
+
+
+def find_same_name_photo_pair(name: str, root: str | Path = OUTPUT_DIR) -> tuple[Path, Path] | None:
+    """Pick one random complete photo pair for `name`, or None if none exist."""
+    pairs = find_same_name_photo_pairs(name, root)
+    return random.choice(pairs) if pairs else None
 
 
 # ── New-tab helpers ───────────────────────────────────────────────────────────
@@ -573,10 +655,98 @@ def upload_idcard(
         return False, f"HTTP {resp.status_code}, non-JSON response: {preview!r}"
 
 
+# ── Same-name-match website upload ────────────────────────────────────────────
+# Fallback for buyers who never completed Taobao real-name verification ("no id"):
+# if we already have a front/back photo pair on file for the exact same name from
+# a previous order, upload it through auodexpress.com's public OCR wizard instead
+# of the signed WMS API (which requires an ID number we don't have from a photo
+# alone). One attempt only — any failure gives up on that waybill.
+
+async def wait_for_step_transition(
+    page, success_selector: str, timeout_s: float = 45.0
+) -> tuple[bool, str]:
+    """Poll until either `success_selector` appears or an error toast shows up."""
+    deadline = time.monotonic() + timeout_s
+    success_loc = page.locator(success_selector)
+    error_loc = page.locator(UPLOAD_SELECTORS["error_toast"])
+    while time.monotonic() < deadline:
+        if await success_loc.count() > 0:
+            return True, ""
+        if await error_loc.count() > 0:
+            text = (await error_loc.first.text_content() or "").strip()
+            if text:
+                return False, text
+        await asyncio.sleep(0.2)
+    return False, "timeout waiting for page response"
+
+
+async def upload_via_website(
+    ctx, waybill: str, front_path: Path, back_path: Path
+) -> tuple[bool, str]:
+    """
+    Drive the auodexpress.com "身份证上传" wizard end to end for one waybill.
+    Runs one at a time (single tab) regardless of caller concurrency.
+    """
+    async with _website_upload_lock:
+        page = await ctx.new_page()
+        page.set_default_timeout(PAGE_TIMEOUT)
+        try:
+            await page.goto(UPLOAD_WEBSITE_URL, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT)
+            await page.wait_for_selector(
+                UPLOAD_SELECTORS["ocr_button"], state="visible", timeout=PAGE_TIMEOUT
+            )
+
+            file_inputs = page.locator(UPLOAD_SELECTORS["front_input"])
+            await file_inputs.nth(0).set_input_files(str(front_path))
+            await human_sleep(1.0, 1.8)
+            await file_inputs.nth(1).set_input_files(str(back_path))
+            await human_sleep(1.0, 1.8)
+
+            await human_click(page.locator(UPLOAD_SELECTORS["ocr_button"]).first, page)
+            ok, reason = await wait_for_step_transition(page, UPLOAD_SELECTORS["step2_visible"])
+            if not ok:
+                return False, f"OCR step failed: {reason}"
+
+            waybill_input = page.locator(UPLOAD_SELECTORS["waybill_input"]).first
+            await waybill_input.wait_for(state="visible", timeout=ELEMENT_TIMEOUT)
+            await waybill_input.click()
+            await page.keyboard.press("Control+a")
+            await human_sleep(0.1, 0.25)
+            await waybill_input.type(waybill, delay=random.randint(60, 140))
+            await human_sleep(0.3, 0.7)
+
+            await human_click(page.locator(UPLOAD_SELECTORS["submit_button"]).first, page)
+            ok, reason = await wait_for_step_transition(page, UPLOAD_SELECTORS["step3_visible"])
+            if not ok:
+                return False, f"submit step failed: {reason}"
+
+            return True, ""
+
+        except Exception as exc:
+            return False, f"error: {str(exc)[:160]}"
+        finally:
+            await page.close()
+
+
 # ── Error logging ─────────────────────────────────────────────────────────────
 
 def write_error(err_log, tracking_num: str, name: str, reason: str) -> None:
     line = f"{tracking_num}\t{name}\t{reason}"
+    logger.warning(f"  SKIP  {line}")
+    err_log.write(line + "\n")
+    err_log.flush()
+
+
+def write_match_note(err_log, tracking_num: str, name: str, note: str) -> None:
+    """Informational log line for the same-name-match flow (not a skip)."""
+    line = f"{tracking_num}\t{name}\t{note}"
+    logger.info(f"  {line}")
+    err_log.write(line + "\n")
+    err_log.flush()
+
+
+def write_match_failure(err_log, tracking_num: str, name: str) -> None:
+    line = f"**{tracking_num}\t{name}\tsame name match fail to upload"
     logger.warning(f"  SKIP  {line}")
     err_log.write(line + "\n")
     err_log.flush()
@@ -858,6 +1028,27 @@ async def worker(
                 if result is None:
                     reason = f"failed after retry: {reason}"
 
+            # "no id" fallback: try to reuse an existing same-name photo pair
+            # via the auodexpress.com upload wizard instead of just logging it.
+            if result is False and reason == "no id" and display_name != "?":
+                pair = find_same_name_photo_pair(display_name)
+                if pair:
+                    write_match_note(err_log, waybill, display_name, "found a same name match")
+                    front_path, back_path = pair
+                    ok, up_reason = await upload_via_website(ctx, waybill, front_path, back_path)
+                    if ok:
+                        write_match_note(
+                            err_log, waybill, display_name, "same name match uploaded successfully"
+                        )
+                        uploads.append((waybill, display_name))
+                        results.append(True)
+                    else:
+                        logger.debug(f"  website upload failed: {up_reason}")
+                        write_match_failure(err_log, waybill, display_name)
+                        results.append(False)
+                    await human_sleep(0.4, 1.2)
+                    continue
+
             # One log entry per waybill, written only on failure
             if result is True:
                 uploads.append((waybill, reason))
@@ -870,6 +1061,98 @@ async def worker(
         await page.close()
 
 
+# ── Replay mode (--from-log) ──────────────────────────────────────────────────
+
+async def run_from_log(log_path: Path) -> None:
+    """
+    Replay a previous run's log file: for every 'no id' entry, retry only the
+    same-name-match website-upload flow (no Taobao search at all, since a
+    normal run already tried and failed on these). Every other reason is
+    carried over unchanged into a new log file.
+    """
+    entries = parse_log_file(log_path)
+    if not entries:
+        logger.error(f"No parseable waybill/name/reason lines found in {log_path}")
+        return
+
+    no_id_entries    = [(wb, name) for wb, name, reason in entries if reason == "no id"]
+    other_entries    = [(wb, name, reason) for wb, name, reason in entries if reason != "no id"]
+    logger.info(
+        f"Loaded {len(entries)} entries from {log_path} — "
+        f"{len(no_id_entries)} 'no id' to retry via same-name match, "
+        f"{len(other_entries)} other entries carried over unchanged"
+    )
+
+    Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
+    CHROME_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    logger.info("Launching browser…")
+
+    async with async_playwright() as p:
+        ctx = await p.chromium.launch_persistent_context(
+            user_data_dir=str(CHROME_PROFILE_DIR),
+            headless=False,
+            viewport={"width": 1920, "height": 1080},
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/132.0.0.0 Safari/537.36"
+            ),
+            args=[
+                "--window-size=1920,1080",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-infobars",
+            ],
+        )
+
+        uploads: list[tuple[str, str]] = []
+        results: list[bool] = []
+        with open(LOG_PATH, "a", encoding="utf-8") as err_log:
+            err_log.write(f"\n=== Replay run started {datetime.now()}  (source: {log_path}) ===\n")
+
+            for waybill, name, reason in other_entries:
+                write_match_note(err_log, waybill, name, reason)
+
+            for idx, (waybill, name) in enumerate(no_id_entries, 1):
+                logger.info(f"[{idx}/{len(no_id_entries)}]  {waybill}  ({name})")
+                if name == "?":
+                    write_error(err_log, waybill, name, "no id")
+                    results.append(False)
+                    continue
+
+                pair = find_same_name_photo_pair(name)
+                if not pair:
+                    write_error(err_log, waybill, name, "no id")
+                    results.append(False)
+                    continue
+
+                write_match_note(err_log, waybill, name, "found a same name match")
+                front_path, back_path = pair
+                ok, up_reason = await upload_via_website(ctx, waybill, front_path, back_path)
+                if ok:
+                    write_match_note(err_log, waybill, name, "same name match uploaded successfully")
+                    uploads.append((waybill, name))
+                    results.append(True)
+                else:
+                    logger.debug(f"  website upload failed: {up_reason}")
+                    write_match_failure(err_log, waybill, name)
+                    results.append(False)
+                await human_sleep(0.4, 1.2)
+
+            summary = format_duplicate_name_summary(uploads)
+            for line in summary.splitlines():
+                logger.info(line)
+            err_log.write(summary + "\n")
+            err_log.flush()
+
+        ok_count = sum(results)
+        logger.info(
+            f"Replay finished — {ok_count} OK  ·  {len(results) - ok_count} issues  ·  log: {LOG_PATH}"
+        )
+        await ctx.close()
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 async def main() -> None:
@@ -879,9 +1162,16 @@ async def main() -> None:
                      help="Path to xlsx containing tracking numbers (default: testorders.xlsx)")
     src.add_argument("--start", metavar="NUM",
                      help="First tracking number in a range, e.g. JR25135001E")
+    src.add_argument("--from-log", metavar="FILE",
+                     help="Replay a previous run's log file: retry only 'no id' lines via the "
+                          "same-name-match website upload, skipping Taobao entirely")
     parser.add_argument("--end", metavar="NUM",
                         help="Last tracking number in range (required with --start)")
     args = parser.parse_args()
+
+    if args.from_log:
+        await run_from_log(Path(args.from_log))
+        return
 
     phones_map = parse_phones_file(PHONES_PATH)
 
