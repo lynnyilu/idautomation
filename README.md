@@ -10,7 +10,7 @@ Given a list of waybills — from an Excel file, or a `--start`/`--end` range ma
 5. Saves them as `<name>.jpg` / `<name>1.jpg` in a dated output subfolder
 6. Uploads name, ID number, validity period, mobile, and both images to the WMS API (`api/Open/IdcardAdd`)
 
-If a buyer hasn't completed Taobao's real-name verification (`no id`), and a photo pair for that exact name already exists from a previous order, the script falls back to uploading through auodexpress.com's public ID-upload wizard instead of giving up — see [Same-name-match fallback](#same-name-match-fallback-no-id) below.
+If a buyer hasn't completed Taobao's real-name verification (`no id`), the script first tries to reuse a photo pair already on file for that exact name. If none exists, it uploads a random **old** photo pair as a temporary placeholder (to be replaced later) — see [Same-name-match fallback](#same-name-match-fallback-no-id) and [Random placeholder fallback](#random-placeholder-fallback-no-id-no-name-match).
 
 ---
 
@@ -46,6 +46,8 @@ playwright install chromium
 | `PHONES_PATH` | `phones.txt` | Waybill → name/mobile lookup, pasted in before each run |
 | `ORDER_SEARCH_URL` | myseller.taobao.com | The order search page URL |
 | `CONCURRENCY` | `2` | How many Taobao orders are processed at the same time |
+| `OLD_FOLDER_MIN_AGE_DAYS` | `10` | Placeholder photos must come from a subfolder older than this, or from files sitting directly in `OUTPUT_DIR` |
+| `RANDOM_PLACEHOLDER_MAX_RETRIES` | `2` | Extra placeholder pairs to try after the first one fails (`no id - retried x times`) |
 
 WMS API credentials (`API_CONSIGNOR`, `API_TOKEN`) also live at the top of `automation.py`.
 
@@ -64,12 +66,12 @@ python automation.py --xlsx path\to\orders.xlsx
 python automation.py --start JR25135001E --end JR25135050E
 ```
 
-**Replaying a previous log** (see [Replay mode](#replay-mode---from-log) below):
+**Replaying a previous log** (see [Replay mode](#replay-mode---from-log) below). Logs live in `OUTPUT_DIR`; pass the full path:
 ```
-python automation.py --from-log "C:\Users\Lynn\Documents\JJ\身份证\log_20260918_190138.txt"
+python automation.py --from-log "C:\Users\Lynn\Documents\JJ\身份证\log_20260918_233507.txt"
 ```
 
-A Chrome window will open (except in `--from-log` mode, which doesn't need Taobao). **Log in to the seller platform** if prompted, then press **Enter** in the terminal to start processing. On future runs your login session is remembered automatically — just press Enter straight away.
+A Chrome window will open in every mode (the website-upload fallback needs it). For a normal `--start`/`--xlsx` run, **log in to the seller platform** if prompted, then press **Enter** in the terminal to start processing. `--from-log` skips Taobao entirely and starts as soon as the browser is up. On future runs your login session is remembered automatically — just press Enter straight away.
 
 ---
 
@@ -96,11 +98,13 @@ A timestamped log file is also written to `OUTPUT_DIR` (e.g. `log_20260302_09000
 
 ## Error log
 
-Every waybill that doesn't go through the normal WMS API upload gets exactly **one** tab-separated line, `<waybill>\t<name>\t<reason>` (the in-progress "found a same name match" state is printed to the console for visibility but is not written to the file — only the final outcome is):
+Every waybill that doesn't go through the normal WMS API upload gets exactly **one** tab-separated line, `<waybill>\t<name>\t<reason>` (the in-progress "found a same name match" / "trying placeholder" states are printed to the console for visibility but are not written to the file — only the final outcome is). After the duplicate-name summary, the log may also list placeholder files that failed during this run (`<filename> has been tried and reported error: …`); those extra lines are not waybill rows.
 
 | Reason | Meaning |
 |---|---|
-| `no id` | Buyer hasn't completed identity verification, and no existing photo match was found either |
+| `no id` | Buyer hasn't completed identity verification, no same-name photo match was found, and there was no eligible old pair left to try as a placeholder |
+| `no id - retried x times` | Same as above, but 1–3 random old pairs were tried (first attempt plus up to 2 retries) and all failed |
+| `no id, uploaded <name> - to be replaced later` | No same-name match; a random old pair (`<name>`) was uploaded as a placeholder |
 | `same name match uploaded successfully` | Buyer hasn't completed verification, but a same-name photo match was found and the website-upload fallback succeeded |
 | `**...same name match fail to upload` | Same as above, but the fallback upload failed at some step — `**`-prefixed so it's easy to grep for |
 | `请确认订单信息` | Order not found or status unclear |
@@ -113,10 +117,10 @@ Every waybill that doesn't go through the normal WMS API upload gets exactly **o
 The WMS API (`IdcardAdd`) requires an ID **number**, which we only get by reading it off the Taobao verification page — if the buyer never completed verification, we have no ID number, so the API path is a dead end even if we had a photo. To get around this without OCR'ing the number ourselves (unreliable — watermarks on some scans obscure digits), the script instead drives auodexpress.com's own public ID-upload wizard, which does the OCR server-side:
 
 1. Look up the buyer's exact name (from `phones.txt`) in the same-name photo index (see below) — every complete front/back photo pair filed under that name, across every dated subfolder.
-2. If **no** pair exists anywhere, log a plain `no id` — nothing else to try.
+2. If **no** pair exists anywhere, fall through to the [random placeholder fallback](#random-placeholder-fallback-no-id-no-name-match) instead of giving up.
 3. If one or more pairs exist, **pick one at random** (deliberate — spreads reuse across candidates rather than always resubmitting the same photo for a repeat name). "found a same name match" is printed to the console at this point, but not written to the log file yet — see [Error log](#error-log).
 4. Upload that pair through `https://www.auodexpress.com/user.html#/upload-card-id`: upload front → upload back → click 开始识别身份证 (OCR) → fill in 运单号 with the waybill → click 确认提交.
-5. **One attempt only.** Any failure at any step (image rejected, OCR timeout/error, submit error) gives up on that waybill immediately and logs `**...same name match fail to upload` — no retry, no partial credit.
+5. **One attempt only.** Any failure at any step (image rejected, OCR timeout/error, submit error) gives up on that waybill immediately and logs `**...same name match fail to upload` — no retry, no placeholder, no partial credit.
 
 This flow always runs **single-tab / sequential**, even while the normal Taobao workers run with `CONCURRENCY` in parallel — a deliberate scope decision to keep it easy to watch and debug while the flow is still being tuned, not a hard technical limit.
 
@@ -129,19 +133,31 @@ Searching all ~40k+ files under `OUTPUT_DIR` from scratch on every lookup doesn'
 - Folders that no longer exist on disk are dropped from the cache automatically.
 - If you ever reorganize or delete old photos and need a full rebuild, just delete `name_index_cache.json` — it'll be rebuilt (scanning everything once) on the next run.
 
+### Random placeholder fallback (`no id`, no name match)
+
+If the same-name lookup finds nothing (the case that used to log a plain `no id`), the script uploads a **random existing photo pair** as a temporary stand-in for that waybill, through the same auodexpress.com wizard:
+
+1. Eligible pairs are files sitting **directly** in `OUTPUT_DIR`, plus complete pairs inside any subfolder whose Windows creation time is **at least 10 days ago**. Folders created within the last 10 days (including today's dated folder) are skipped.
+2. Pick one pair at random. A pair that already succeeded or already failed earlier in this run is never reused.
+3. On success, log `<waybill>	<original name>	no id, uploaded <placeholder name> - to be replaced later`.
+4. On any error, **do not log that attempt yet** — try a different pair. First attempt plus **up to 2 retries** (3 pairs max). If they all fail, log `no id - retried x times` (`x` is how many extra attempts ran after the first). If the pool was empty and nothing was tried, log a plain `no id`.
+5. At the **end of the whole run**, every pair that failed is listed once as `<filename> has been tried and reported error: <message>` (message included when the wizard/page gave one). Other error reasons (API, timeout, same-name upload fail, etc.) are unchanged.
+
+This also runs in `--from-log` mode, for every source line whose reason is exactly `no id`.
+
 ### Replay mode (`--from-log`)
 
 ```
-python automation.py --from-log <path to a previous run's log file>
+python automation.py --from-log "C:\Users\Lynn\Documents\JJ\身份证\log_20260918_233507.txt"
 ```
 
-Re-processes only the `no id` lines from that log through the same-name-match flow above — it never touches Taobao at all, since a normal run already tried and failed on those. Every other reason in the source log (API errors, timeouts, `could not open ID viewer page`, and — since only the final outcome is ever logged — any prior `same name match uploaded successfully` / `**...fail to upload` line) is carried through **unchanged** into a new, separate timestamped log file. This means feeding a log back through `--from-log` a second time is safe: only genuine still-unmatched `no id` entries get retried, previously matched ones are left alone. This mode exists mainly for testing/iterating on the website-upload flow without re-running an entire batch.
+Re-processes only the `no id` lines from that log through the same-name-match flow above, then the random placeholder if there is still no name match — it never touches Taobao at all, since a normal run already tried and failed on those. Every other reason in the source log (API errors, timeouts, `could not open ID viewer page`, prior `same name match uploaded successfully` / `**...fail to upload`, `no id, uploaded … - to be replaced later`, and `no id - retried x times`) is carried through **unchanged** into a new, separate timestamped log file. This means feeding a log back through `--from-log` a second time is safe: only genuine still-unmatched `no id` entries get retried, previously matched or already-placeholder-tried ones are left alone. This mode exists mainly for testing/iterating on the website-upload flow without re-running an entire batch.
 
 ---
 
 ## How it works
 
-- **`CONCURRENCY` parallel workers** each keep their own Taobao search tab open and pull orders from a shared queue; the website-upload fallback is serialized behind all of them (single tab, see above)
+- **`CONCURRENCY` parallel workers** each keep their own Taobao search tab open and pull orders from a shared queue; the website-upload fallback (same-name match and random placeholder) is serialized behind all of them (single tab, see above)
 - Each order opens the ID viewer in a new tab, captures both images, then closes that tab
 - Images are captured via network response interception (primary) with `<img src>` fetch and screenshot as fallbacks
 - A minimum size check (20 KB) rejects placeholder/loading images before saving

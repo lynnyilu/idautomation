@@ -7,12 +7,16 @@ mobile from phones.txt, downloads face + back ID images to a daily subfolder,
 scrapes the ID number and validity period from the ID viewer page, then
 uploads everything to the WMS API (api/Open/IdcardAdd).
 
+If a buyer never completed Taobao real-name verification ("no id"), the script
+tries a same-name photo pair first, then a random old pair as a placeholder.
+
 Quick start
 -----------
 1.  pip install -r requirements.txt
 2.  playwright install chromium
 3.  Edit phones.txt with this run's waybill → name + mobile data
 4.  python automation.py --start JR25135001E --end JR25135050E
+5.  python automation.py --from-log "<OUTPUT_DIR>\\log_YYYYMMDD_HHMMSS.txt"
 """
 
 import argparse
@@ -28,7 +32,7 @@ import random
 import string
 import time
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import openpyxl
 import requests as _sync_requests
@@ -98,6 +102,12 @@ UPLOAD_SELECTORS = {
 PAGE_TIMEOUT    = 30_000
 ELEMENT_TIMEOUT = 15_000
 CONCURRENCY     = 2
+
+# Random placeholder for unmatched "no id": reuse a photo pair from a folder
+# older than this, or from files sitting directly in OUTPUT_DIR. First attempt
+# plus this many retries (different pairs); then log `no id - retried x times`.
+OLD_FOLDER_MIN_AGE_DAYS          = 10
+RANDOM_PLACEHOLDER_MAX_RETRIES   = 2
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -484,6 +494,86 @@ def find_same_name_photo_pair(name: str, index: NameIndex) -> tuple[Path, Path] 
     return random.choice(pairs) if pairs else None
 
 
+def _is_recent_folder(path: Path, days: int = OLD_FOLDER_MIN_AGE_DAYS) -> bool:
+    """True if `path` was created within the last `days` days (Windows ctime)."""
+    try:
+        created = datetime.fromtimestamp(path.stat().st_ctime)
+    except OSError:
+        return True
+    return datetime.now() - created < timedelta(days=days)
+
+
+def build_old_photo_pool(root: str | Path = OUTPUT_DIR) -> list[tuple[Path, Path]]:
+    """
+    Complete photo pairs eligible as random 'no id' placeholders:
+    files sitting directly in OUTPUT_DIR, plus pairs inside subfolders whose
+    Windows creation time is at least OLD_FOLDER_MIN_AGE_DAYS ago.
+
+    Call after build_name_index() so the on-disk cache is already fresh —
+    old folders are read from that cache instead of being walked again.
+    """
+    root = Path(root)
+    pairs: list[tuple[Path, Path]] = []
+    if not root.is_dir():
+        return pairs
+
+    for _name, file_pairs in _scan_folder_for_pairs(root).items():
+        pairs.extend((Path(f), Path(b)) for f, b in file_pairs)
+
+    cache = _load_name_index_cache()
+    for folder_name, folder_pairs in cache.items():
+        folder_path = root / folder_name
+        if not folder_path.is_dir() or _is_recent_folder(folder_path):
+            continue
+        for _name, file_pairs in folder_pairs.items():
+            pairs.extend((Path(f), Path(b)) for f, b in file_pairs)
+    return pairs
+
+
+def _pair_buyer_name(front_path: Path) -> str:
+    split = _split_name_suffix(front_path.stem)
+    return split[0] if split else front_path.stem
+
+
+def _pair_log_filename(front_path: Path) -> str:
+    try:
+        return str(front_path.relative_to(OUTPUT_DIR))
+    except ValueError:
+        return front_path.name
+
+
+class RandomPlaceholderPool:
+    """Thread-safe bag of old photo pairs; each pair is used at most once per run."""
+
+    def __init__(self, pairs: list[tuple[Path, Path]]):
+        self._available = list(pairs)
+        self._failed: list[tuple[str, str]] = []  # (filename, error)
+        self._lock = asyncio.Lock()
+
+    def __len__(self) -> int:
+        return len(self._available)
+
+    async def take(self) -> tuple[Path, Path] | None:
+        async with self._lock:
+            if not self._available:
+                return None
+            idx = random.randrange(len(self._available))
+            return self._available.pop(idx)
+
+    async def record_failure(self, pair: tuple[Path, Path], error: str) -> None:
+        async with self._lock:
+            self._failed.append((_pair_log_filename(pair[0]), error or ""))
+
+    def failed_lines(self) -> list[str]:
+        lines = []
+        for filename, error in self._failed:
+            msg = f"{filename} has been tried and reported error"
+            if error:
+                msg += f": {error}"
+            lines.append(msg)
+        return lines
+
+
 # ── New-tab helpers ───────────────────────────────────────────────────────────
 
 async def find_content_frame(page, selector: str, timeout_ms: int = 5_000):
@@ -785,6 +875,87 @@ async def upload_via_website(
             await page.close()
 
 
+async def try_random_placeholder_upload(
+    ctx,
+    waybill: str,
+    original_name: str,
+    pool: RandomPlaceholderPool,
+    err_log,
+    uploads: list[tuple[str, str]],
+) -> bool:
+    """
+    Upload a random old photo pair as a placeholder for a 'no id' waybill.
+    First attempt plus RANDOM_PLACEHOLDER_MAX_RETRIES different pairs.
+    Per-attempt failures are held until the end of the run.
+    """
+    max_attempts = 1 + RANDOM_PLACEHOLDER_MAX_RETRIES
+    attempts = 0
+    for _ in range(max_attempts):
+        pair = await pool.take()
+        if pair is None:
+            break
+        attempts += 1
+        front_path, back_path = pair
+        new_name = _pair_buyer_name(front_path)
+        logger.info(
+            f"  {waybill}\t{original_name}\tno id, trying placeholder {new_name}"
+        )
+        ok, up_reason = await upload_via_website(ctx, waybill, front_path, back_path)
+        if ok:
+            write_match_note(
+                err_log,
+                waybill,
+                original_name,
+                f"no id, uploaded {new_name} - to be replaced later",
+            )
+            uploads.append((waybill, original_name))
+            return True
+        await pool.record_failure(pair, up_reason)
+        await human_sleep(0.4, 1.2)
+
+    if attempts == 0:
+        write_error(err_log, waybill, original_name, "no id")
+    else:
+        write_error(
+            err_log, waybill, original_name, f"no id - retried {attempts - 1} times"
+        )
+    return False
+
+
+async def handle_no_id(
+    ctx,
+    waybill: str,
+    name: str,
+    name_index: NameIndex,
+    pool: RandomPlaceholderPool,
+    err_log,
+    uploads: list[tuple[str, str]],
+) -> bool:
+    """
+    Same-name website upload if a pair exists for `name`; otherwise a random
+    old-pair placeholder. Returns True if some website upload succeeded.
+    """
+    if name != "?":
+        pair = find_same_name_photo_pair(name, name_index)
+        if pair:
+            logger.info(f"  {waybill}\t{name}\tfound a same name match")
+            front_path, back_path = pair
+            ok, up_reason = await upload_via_website(ctx, waybill, front_path, back_path)
+            if ok:
+                write_match_note(
+                    err_log, waybill, name, "same name match uploaded successfully"
+                )
+                uploads.append((waybill, name))
+                return True
+            logger.debug(f"  website upload failed: {up_reason}")
+            write_match_failure(err_log, waybill, name)
+            return False
+
+    return await try_random_placeholder_upload(
+        ctx, waybill, name, pool, err_log, uploads
+    )
+
+
 # ── Error logging ─────────────────────────────────────────────────────────────
 
 def write_error(err_log, tracking_num: str, name: str, reason: str) -> None:
@@ -806,6 +977,18 @@ def write_match_failure(err_log, tracking_num: str, name: str) -> None:
     line = f"**{tracking_num}\t{name}\tsame name match fail to upload"
     logger.warning(f"  SKIP  {line}")
     err_log.write(line + "\n")
+    err_log.flush()
+
+
+def write_placeholder_failure_summary(err_log, pool: "RandomPlaceholderPool") -> None:
+    """Append end-of-run notes for placeholder pairs that failed to upload."""
+    lines = pool.failed_lines()
+    if not lines:
+        return
+    logger.info("Placeholder upload errors:")
+    for line in lines:
+        logger.info(f"  {line}")
+        err_log.write(line + "\n")
     err_log.flush()
 
 
@@ -1061,6 +1244,7 @@ async def process_one(
 async def worker(
     ctx, queue: asyncio.Queue, err_log, results: list, phones_map: dict,
     uploads: list[tuple[str, str]], name_index: NameIndex,
+    placeholder_pool: RandomPlaceholderPool,
 ) -> None:
     page = await ctx.new_page()
     page.set_default_timeout(PAGE_TIMEOUT)
@@ -1085,26 +1269,16 @@ async def worker(
                 if result is None:
                     reason = f"failed after retry: {reason}"
 
-            # "no id" fallback: try to reuse an existing same-name photo pair
-            # via the auodexpress.com upload wizard instead of just logging it.
-            if result is False and reason == "no id" and display_name != "?":
-                pair = find_same_name_photo_pair(display_name, name_index)
-                if pair:
-                    logger.info(f"  {waybill}\t{display_name}\tfound a same name match")
-                    front_path, back_path = pair
-                    ok, up_reason = await upload_via_website(ctx, waybill, front_path, back_path)
-                    if ok:
-                        write_match_note(
-                            err_log, waybill, display_name, "same name match uploaded successfully"
-                        )
-                        uploads.append((waybill, display_name))
-                        results.append(True)
-                    else:
-                        logger.debug(f"  website upload failed: {up_reason}")
-                        write_match_failure(err_log, waybill, display_name)
-                        results.append(False)
-                    await human_sleep(0.4, 1.2)
-                    continue
+            # "no id" fallback: same-name pair via the website wizard, or else
+            # a random old photo pair as a placeholder to be replaced later.
+            if result is False and reason == "no id":
+                ok = await handle_no_id(
+                    ctx, waybill, display_name, name_index,
+                    placeholder_pool, err_log, uploads,
+                )
+                results.append(ok)
+                await human_sleep(0.4, 1.2)
+                continue
 
             # One log entry per waybill, written only on failure
             if result is True:
@@ -1122,8 +1296,9 @@ async def worker(
 
 async def run_from_log(log_path: Path) -> None:
     """
-    Replay a previous run's log file: for every 'no id' entry, retry only the
-    same-name-match website-upload flow (no Taobao search at all, since a
+    Replay a previous run's log file: for every 'no id' entry, retry the
+    same-name-match website-upload flow and, if that still has nothing,
+    a random old-pair placeholder (no Taobao search at all, since a
     normal run already tried and failed on these). Every other reason is
     carried over unchanged into a new log file.
     """
@@ -1136,7 +1311,7 @@ async def run_from_log(log_path: Path) -> None:
     other_entries    = [(wb, name, reason) for wb, name, reason in entries if reason != "no id"]
     logger.info(
         f"Loaded {len(entries)} entries from {log_path} — "
-        f"{len(no_id_entries)} 'no id' to retry via same-name match, "
+        f"{len(no_id_entries)} 'no id' to retry via same-name / placeholder, "
         f"{len(other_entries)} other entries carried over unchanged"
     )
 
@@ -1165,6 +1340,8 @@ async def run_from_log(log_path: Path) -> None:
 
         name_index = build_name_index()
         logger.info(f"Same-name index: {len(name_index)} name(s) with a usable photo pair")
+        placeholder_pool = RandomPlaceholderPool(build_old_photo_pool())
+        logger.info(f"Placeholder pool: {len(placeholder_pool)} old photo pair(s)")
 
         uploads: list[tuple[str, str]] = []
         results: list[bool] = []
@@ -1176,34 +1353,17 @@ async def run_from_log(log_path: Path) -> None:
 
             for idx, (waybill, name) in enumerate(no_id_entries, 1):
                 logger.info(f"[{idx}/{len(no_id_entries)}]  {waybill}  ({name})")
-                if name == "?":
-                    write_error(err_log, waybill, name, "no id")
-                    results.append(False)
-                    continue
-
-                pair = find_same_name_photo_pair(name, name_index)
-                if not pair:
-                    write_error(err_log, waybill, name, "no id")
-                    results.append(False)
-                    continue
-
-                logger.info(f"  {waybill}\t{name}\tfound a same name match")
-                front_path, back_path = pair
-                ok, up_reason = await upload_via_website(ctx, waybill, front_path, back_path)
-                if ok:
-                    write_match_note(err_log, waybill, name, "same name match uploaded successfully")
-                    uploads.append((waybill, name))
-                    results.append(True)
-                else:
-                    logger.debug(f"  website upload failed: {up_reason}")
-                    write_match_failure(err_log, waybill, name)
-                    results.append(False)
+                ok = await handle_no_id(
+                    ctx, waybill, name, name_index, placeholder_pool, err_log, uploads
+                )
+                results.append(ok)
                 await human_sleep(0.4, 1.2)
 
             summary = format_duplicate_name_summary(uploads)
             for line in summary.splitlines():
                 logger.info(line)
             err_log.write(summary + "\n")
+            write_placeholder_failure_summary(err_log, placeholder_pool)
             err_log.flush()
 
         ok_count = sum(results)
@@ -1224,7 +1384,7 @@ async def main() -> None:
                      help="First tracking number in a range, e.g. JR25135001E")
     src.add_argument("--from-log", metavar="FILE",
                      help="Replay a previous run's log file: retry only 'no id' lines via the "
-                          "same-name-match website upload, skipping Taobao entirely")
+                          "same-name-match / placeholder website upload, skipping Taobao entirely")
     parser.add_argument("--end", metavar="NUM",
                         help="Last tracking number in range (required with --start)")
     args = parser.parse_args()
@@ -1311,6 +1471,8 @@ async def main() -> None:
 
         name_index = build_name_index()
         logger.info(f"Same-name index: {len(name_index)} name(s) with a usable photo pair")
+        placeholder_pool = RandomPlaceholderPool(build_old_photo_pool())
+        logger.info(f"Placeholder pool: {len(placeholder_pool)} old photo pair(s)")
 
         results: list[bool] = []
         uploads: list[tuple[str, str]] = []
@@ -1318,7 +1480,10 @@ async def main() -> None:
             err_log.write(f"\n=== Run started {datetime.now()} ===\n")
             await asyncio.gather(
                 *[asyncio.create_task(
-                    worker(ctx, queue, err_log, results, phones_map, uploads, name_index)
+                    worker(
+                        ctx, queue, err_log, results, phones_map,
+                        uploads, name_index, placeholder_pool,
+                    )
                 ) for _ in range(n_workers)]
             )
 
@@ -1326,6 +1491,7 @@ async def main() -> None:
             for line in summary.splitlines():
                 logger.info(line)
             err_log.write(summary + "\n")
+            write_placeholder_failure_summary(err_log, placeholder_pool)
             err_log.flush()
 
         ok_count   = sum(results)
