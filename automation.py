@@ -102,7 +102,8 @@ UPLOAD_SELECTORS = {
     "waybill_input": ".step2 form input.el-input__inner:not([disabled])",
     "submit_button": ".step2 button:has-text('确认提交')",
     "step3_visible": ".step3:not(.hidden)",
-    "error_toast":   ".el-message--error, .el-message--warning",
+    # Token/auth failures surface as an el-notification, not an el-message toast.
+    "error_toast":   ".el-message--error, .el-message--warning, .el-notification",
 }
 
 # Timeouts (milliseconds)
@@ -1115,6 +1116,33 @@ async def wait_for_step_transition(
     return False, "timeout waiting for page response"
 
 
+_UPLOAD_API_MARKERS = ("/api/auth/getToken", "IdCardDistinguishByUrl", "/addIdCard")
+
+
+async def _note_upload_api_response(response, notes: list[str]) -> None:
+    """Record status + server message of the wizard's API calls (never the token itself)."""
+    url = response.url
+    marker = next((m for m in _UPLOAD_API_MARKERS if m in url), None)
+    if marker is None:
+        return
+    note = f"{marker.strip('/').split('/')[-1]} HTTP {response.status}"
+    try:
+        data = await response.json()
+        if isinstance(data, dict):
+            data = {k.lower(): v for k, v in data.items()}
+            if marker == "/api/auth/getToken":
+                note += " (token received)" if data.get("data") else " (no token returned)"
+            else:
+                if data.get("result") is not None:
+                    note += f" result={data.get('result')}"
+                msg = data.get("msg") or data.get("message") or data.get("exceptionmessage")
+                if msg:
+                    note += f" msg={re.sub(r'<[^>]+>', '', str(msg))[:120]}"
+    except Exception:
+        pass
+    notes.append(note)
+
+
 async def upload_via_website(
     ctx, waybill: str, front_path: Path, back_path: Path
 ) -> tuple[bool, str]:
@@ -1129,7 +1157,22 @@ async def upload_via_website(
     async with _website_upload_lock:
         page = await ctx.new_page()
         page.set_default_timeout(PAGE_TIMEOUT)
+        api_notes: list[str] = []
+        page.on("response", lambda r: asyncio.ensure_future(_note_upload_api_response(r, api_notes)))
+
+        def with_api(reason: str) -> str:
+            if "#/login" in page.url:
+                reason += " [redirected to login page]"
+            return reason + (f" [{'; '.join(api_notes)}]" if api_notes else "")
+
         try:
+            # The site embeds its OSS upload key in app~user.*.js and has rotated
+            # the key without renaming the file, so a cached copy uploads with a
+            # dead key (403 InvalidAccessKeyId → "网络超时请检查网络后重试").
+            # Always fetch the wizard's scripts fresh.
+            cdp = await ctx.new_cdp_session(page)
+            await cdp.send("Network.enable")
+            await cdp.send("Network.setCacheDisabled", {"cacheDisabled": True})
             await page.goto(UPLOAD_WEBSITE_URL, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT)
             await page.wait_for_selector(
                 UPLOAD_SELECTORS["ocr_button"], state="visible", timeout=PAGE_TIMEOUT
@@ -1144,7 +1187,7 @@ async def upload_via_website(
             await human_click(page.locator(UPLOAD_SELECTORS["ocr_button"]).first, page)
             ok, reason = await wait_for_step_transition(page, UPLOAD_SELECTORS["step2_visible"])
             if not ok:
-                return False, f"OCR step failed: {reason}"
+                return False, with_api(f"OCR step failed: {reason}")
 
             waybill_input = page.locator(UPLOAD_SELECTORS["waybill_input"]).first
             await waybill_input.wait_for(state="visible", timeout=ELEMENT_TIMEOUT)
@@ -1157,7 +1200,7 @@ async def upload_via_website(
             await human_click(page.locator(UPLOAD_SELECTORS["submit_button"]).first, page)
             ok, reason = await wait_for_step_transition(page, UPLOAD_SELECTORS["step3_visible"])
             if not ok:
-                return False, f"submit step failed: {reason}"
+                return False, with_api(f"submit step failed: {reason}")
 
             try:
                 await _upload_history.record(front_path)
@@ -1169,7 +1212,7 @@ async def upload_via_website(
             if not _pair_files_exist(front_path, back_path):
                 prune_missing_photo_pair(front_path, back_path)
                 return False, "photo file missing"
-            return False, f"error: {str(exc)[:160]}"
+            return False, with_api(f"error: {str(exc)[:160]}")
         finally:
             await page.close()
 
@@ -1210,6 +1253,7 @@ async def try_random_placeholder_upload(
             uploads.append((waybill, original_name))
             return True
         await pool.record_failure(pair, up_reason)
+        write_upload_error_detail(err_log, f"{waybill} placeholder {label}: {up_reason}")
         await human_sleep(0.4, 1.2)
 
     if attempts == 0:
@@ -1246,8 +1290,8 @@ async def handle_no_id(
                 )
                 uploads.append((waybill, name))
                 return True
-            logger.debug(f"  website upload failed: {up_reason}")
             write_match_failure(err_log, waybill, name)
+            write_upload_error_detail(err_log, f"{front_path.name}: {up_reason}")
             return False
 
     return await try_random_placeholder_upload(
@@ -1308,6 +1352,15 @@ def write_match_note(err_log, tracking_num: str, name: str, note: str) -> None:
     tracking_num = tracking_num.lstrip("*").strip()
     line = f"{tracking_num}\t{name}\t{note}"
     logger.info(f"  {line}")
+    err_log.write(line + "\n")
+    err_log.flush()
+
+
+def write_upload_error_detail(err_log, detail: str) -> None:
+    """Website-upload failure reason, written as it happens (no tabs, so
+    --from-log parsing ignores it)."""
+    line = "    upload error: " + detail.replace("\t", " ")
+    logger.warning(line)
     err_log.write(line + "\n")
     err_log.flush()
 
