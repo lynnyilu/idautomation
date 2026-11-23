@@ -116,6 +116,7 @@ CONCURRENCY     = 2
 # plus this many retries (different pairs); then log `no id - retried x times`.
 OLD_FOLDER_MIN_AGE_DAYS          = 10
 RANDOM_PLACEHOLDER_MAX_RETRIES   = 2
+SAME_NAME_MAX_RETRIES            = 2  # extra attempts with the same same-name pair
 PLACEHOLDER_MAX_NAME_LEN         = 3  # skip names like 欧阳春晓 (4+ chars)
 PLACEHOLDER_MIN_IDLE_DAYS        = 10  # skip pairs uploaded this recently
 
@@ -434,10 +435,20 @@ def _split_name_suffix(stem: str) -> tuple[str, int] | None:
     return stem[:i], (int(suffix_str) if suffix_str else 0)
 
 
-def _scan_folder_for_pairs(folder: Path) -> dict[str, list[tuple[str, str]]]:
-    """Group every complete front/back photo pair in `folder` by buyer name."""
+def _scan_folder_for_pairs(
+    folder: Path, recursive: bool = False
+) -> dict[str, list[tuple[str, str]]]:
+    """Group every complete front/back photo pair in `folder` by buyer name.
+
+    Pairs are matched within one directory. With `recursive`, nested
+    subfolders (e.g. 2026-05-08/07MAY) are scanned too.
+    """
     by_name_suffix: dict[str, dict[int, str]] = {}
+    subdirs: list[Path] = []
     for entry in os.scandir(folder):
+        if entry.is_dir():
+            subdirs.append(Path(entry.path))
+            continue
         if not entry.is_file():
             continue
         p = Path(entry.path)
@@ -458,7 +469,26 @@ def _scan_folder_for_pairs(folder: Path) -> dict[str, list[tuple[str, str]]]:
         ]
         if pairs:
             result[name] = pairs
+    if recursive:
+        for sub in subdirs:
+            for name, pairs in _scan_folder_for_pairs(sub, recursive=True).items():
+                result.setdefault(name, []).extend(pairs)
     return result
+
+
+def _folder_tree_mtime(folder: Path) -> float:
+    """Latest mtime of `folder` or any nested subfolder (changes when files
+    are added/removed/renamed directly inside it)."""
+    latest = 0.0
+    stack = [folder]
+    while stack:
+        d = stack.pop()
+        try:
+            latest = max(latest, d.stat().st_mtime)
+            stack.extend(Path(e.path) for e in os.scandir(d) if e.is_dir())
+        except OSError:
+            continue
+    return latest
 
 
 def _load_name_index_cache() -> dict[str, dict]:
@@ -474,32 +504,62 @@ def _save_name_index_cache(cache: dict[str, dict]) -> None:
     tmp.replace(NAME_INDEX_CACHE_PATH)
 
 
+_NAME_INDEX_CACHE_VERSION = 2   # bump to force a one-time full rebuild
+_CACHE_META_KEY = "__meta__"    # {"version": int, "mtimes": {folder: mtime}}
+
+
 def build_name_index(root: str | Path = OUTPUT_DIR) -> NameIndex:
     """
-    Refresh the on-disk per-folder cache (scanning only new folders and
-    today's folder) and return the merged name -> [(front, back), ...] index.
+    Refresh the on-disk per-folder cache and return the merged
+    name -> [(front, back), ...] index.
+
+    - Photos sitting directly in `root` are scanned on every run (not cached;
+      that folder keeps growing).
+    - Each subfolder (including nested subfolders) is cached, and rescanned
+      when it is new, is today's folder, or its folder mtime has changed
+      (i.e. files were added/removed since the last scan).
     """
     root = Path(root)
-    cache = _load_name_index_cache()
     if not root.is_dir():
         return {}
+    cache = _load_name_index_cache()
+    meta = cache.pop(_CACHE_META_KEY, None)
+    if not isinstance(meta, dict) or meta.get("version") != _NAME_INDEX_CACHE_VERSION:
+        logger.info("Same-name index: cache format changed — rebuilding all folders once")
+        cache, meta = {}, {}
+    mtimes: dict[str, float] = meta.get("mtimes") or {}
 
     subfolders = {e.name: Path(e.path) for e in os.scandir(root) if e.is_dir()}
 
+    rescanned = 0
     for folder_name, folder_path in subfolders.items():
-        if folder_name in cache and folder_name != _TODAY_LABEL:
+        mtime = _folder_tree_mtime(folder_path)
+        if (
+            folder_name in cache
+            and folder_name != _TODAY_LABEL
+            and mtimes.get(folder_name) == mtime
+        ):
             continue
-        cache[folder_name] = _scan_folder_for_pairs(folder_path)
+        cache[folder_name] = _scan_folder_for_pairs(folder_path, recursive=True)
+        mtimes[folder_name] = mtime
+        rescanned += 1
 
     for stale in set(cache) - set(subfolders):
         del cache[stale]
-
-    _save_name_index_cache(cache)
+    mtimes = {k: v for k, v in mtimes.items() if k in subfolders}
+    if rescanned:
+        logger.info(f"Same-name index: rescanned {rescanned} folder(s)")
 
     merged: NameIndex = {}
     for folder_pairs in cache.values():
         for name, pairs in folder_pairs.items():
             merged.setdefault(name, []).extend((Path(f), Path(b)) for f, b in pairs)
+
+    for name, pairs in _scan_folder_for_pairs(root).items():
+        merged.setdefault(name, []).extend((Path(f), Path(b)) for f, b in pairs)
+
+    cache[_CACHE_META_KEY] = {"version": _NAME_INDEX_CACHE_VERSION, "mtimes": mtimes}
+    _save_name_index_cache(cache)
     return merged
 
 
@@ -570,6 +630,7 @@ def is_api_413_after_retry(reason: str) -> bool:
 
 
 ID_VIEWER_FAIL_AFTER_RETRY = "failed after retry: could not open ID viewer page"
+CONFIRM_ORDER_INFO = "请确认订单信息"
 
 
 def should_run_no_id_fallback(reason: str) -> bool:
@@ -682,7 +743,7 @@ def _prune_from_name_index_cache(front: Path, back: Path) -> bool:
     cache = _load_name_index_cache()
     changed = False
     for folder_name, folder_pairs in list(cache.items()):
-        if not isinstance(folder_pairs, dict):
+        if folder_name == _CACHE_META_KEY or not isinstance(folder_pairs, dict):
             continue
         for name, pairs in list(folder_pairs.items()):
             kept = []
@@ -777,6 +838,8 @@ def build_old_photo_pool(root: str | Path = OUTPUT_DIR) -> list[tuple[Path, Path
 
     cache = _load_name_index_cache()
     for folder_name, folder_pairs in cache.items():
+        if folder_name == _CACHE_META_KEY:
+            continue
         folder_path = root / folder_name
         if not folder_path.is_dir() or _is_recent_folder(folder_path):
             continue
@@ -1224,9 +1287,11 @@ async def try_random_placeholder_upload(
     pool: RandomPlaceholderPool,
     err_log,
     uploads: list[tuple[str, str]],
+    reason: str = "no id",
 ) -> bool:
     """
-    Upload a random old photo pair as a placeholder for a 'no id' waybill.
+    Upload a random old photo pair as a placeholder for a 'no id' (or
+    '请确认订单信息') waybill. `reason` prefixes the log lines.
     First attempt plus RANDOM_PLACEHOLDER_MAX_RETRIES different pairs.
     Per-attempt failures are held until the end of the run.
     """
@@ -1240,7 +1305,7 @@ async def try_random_placeholder_upload(
         front_path, back_path = pair
         label = _placeholder_upload_label(front_path)
         logger.info(
-            f"  {waybill}\t{original_name}\tno id, trying placeholder {label}"
+            f"  {waybill}\t{original_name}\t{reason}, trying placeholder {label}"
         )
         ok, up_reason = await upload_via_website(ctx, waybill, front_path, back_path)
         if ok:
@@ -1248,7 +1313,7 @@ async def try_random_placeholder_upload(
                 err_log,
                 waybill,
                 original_name,
-                f"no id, uploaded {label} - to be replaced later",
+                f"{reason}, uploaded {label} - to be replaced later",
             )
             uploads.append((waybill, original_name))
             return True
@@ -1257,10 +1322,10 @@ async def try_random_placeholder_upload(
         await human_sleep(0.4, 1.2)
 
     if attempts == 0:
-        write_error(err_log, waybill, original_name, "no id")
+        write_error(err_log, waybill, original_name, reason)
     else:
         write_error(
-            err_log, waybill, original_name, f"no id - retried {attempts - 1} times"
+            err_log, waybill, original_name, f"{reason} - retried {attempts - 1} times"
         )
     return False
 
@@ -1273,29 +1338,45 @@ async def handle_no_id(
     pool: RandomPlaceholderPool,
     err_log,
     uploads: list[tuple[str, str]],
+    reason: str = "no id",
 ) -> bool:
     """
     Same-name website upload if a pair exists for `name`; otherwise a random
     old-pair placeholder. Returns True if some website upload succeeded.
+    `reason` is the original failure ('no id' or '请确认订单信息'); anything
+    other than 'no id' is prefixed onto the same-name log lines.
     """
+    prefix = "" if reason == "no id" else f"{reason}, "
     if name != "?":
         pair = find_same_name_photo_pair(name, name_index)
         if pair:
-            logger.info(f"  {waybill}\t{name}\tfound a same name match")
+            logger.info(f"  {waybill}\t{name}\t{prefix}found a same name match")
             front_path, back_path = pair
-            ok, up_reason = await upload_via_website(ctx, waybill, front_path, back_path)
-            if ok:
-                write_match_note(
-                    err_log, waybill, name, "same name match uploaded successfully"
+            max_attempts = 1 + SAME_NAME_MAX_RETRIES
+            for attempt in range(1, max_attempts + 1):
+                ok, up_reason = await upload_via_website(ctx, waybill, front_path, back_path)
+                if ok:
+                    write_match_note(
+                        err_log, waybill, name,
+                        f"{prefix}same name match uploaded successfully",
+                    )
+                    uploads.append((waybill, name))
+                    return True
+                write_upload_error_detail(
+                    err_log,
+                    f"{front_path.name} (attempt {attempt}/{max_attempts}): {up_reason}",
                 )
-                uploads.append((waybill, name))
-                return True
-            write_match_failure(err_log, waybill, name)
-            write_upload_error_detail(err_log, f"{front_path.name}: {up_reason}")
+                if attempt < max_attempts:
+                    logger.info(f"  {waybill}\t{name}\tsame name upload failed — retrying same pair…")
+                    await human_sleep(1.5, 3.0)
+            write_error(
+                err_log, waybill, name,
+                f"{prefix}same name match fail to upload - retried {SAME_NAME_MAX_RETRIES} times",
+            )
             return False
 
     return await try_random_placeholder_upload(
-        ctx, waybill, name, pool, err_log, uploads
+        ctx, waybill, name, pool, err_log, uploads, reason
     )
 
 
@@ -1332,15 +1413,26 @@ async def try_website_upload_today_or_yesterday(
 # ── Error logging ─────────────────────────────────────────────────────────────
 
 def is_successful_upload_note(reason: str) -> bool:
-    """True for log reasons that mean a waybill did get an ID uploaded."""
-    if reason in ("same name match uploaded successfully", "found a same name match"):
+    """True for log reasons that mean a waybill did get an ID uploaded.
+
+    Also matches the '请确认订单信息, …' prefixed variants.
+    """
+    if reason.endswith("same name match uploaded successfully"):
         return True
-    return reason.startswith("no id, uploaded ") and "to be replaced later" in reason
+    if reason.endswith("found a same name match"):
+        return True
+    return ", uploaded " in reason and reason.endswith("to be replaced later")
+
+
+# Every waybill that ends this run with nothing uploaded (one entry per
+# write_error call) — listed in the end-of-run summary.
+_run_failures: list[tuple[str, str, str]] = []
 
 
 def write_error(err_log, tracking_num: str, name: str, reason: str) -> None:
     """Unsuccessful waybill — `**`-prefixed so it stands out from upload notes."""
     tracking_num = tracking_num.lstrip("*").strip()
+    _run_failures.append((tracking_num, name, reason))
     line = f"**{tracking_num}\t{name}\t{reason}"
     logger.warning(f"  SKIP  {line}")
     err_log.write(line + "\n")
@@ -1365,10 +1457,6 @@ def write_upload_error_detail(err_log, detail: str) -> None:
     err_log.flush()
 
 
-def write_match_failure(err_log, tracking_num: str, name: str) -> None:
-    write_error(err_log, tracking_num, name, "same name match fail to upload")
-
-
 def write_placeholder_failure_summary(err_log, pool: "RandomPlaceholderPool") -> None:
     """Append end-of-run notes for placeholder pairs that failed to upload."""
     lines = pool.failed_lines()
@@ -1379,6 +1467,30 @@ def write_placeholder_failure_summary(err_log, pool: "RandomPlaceholderPool") ->
         marked = line if line.startswith("**") else f"** {line}"
         logger.warning(f"  SKIP  {marked}")
         err_log.write(marked + "\n")
+    err_log.flush()
+
+
+def write_run_summary(err_log, results: list[bool]) -> None:
+    """Append the final success/failure counts and the list of waybills that
+    ended with nothing uploaded. Uses spaces, not tabs, so --from-log never
+    re-parses these lines as waybill entries."""
+    ok_count = sum(results)
+    fail_count = len(results) - ok_count
+    lines = [
+        "",
+        f"=== 本次汇总：共 {len(results)} 单 · 成功 {ok_count} 单 · 失败 {fail_count} 单 ===",
+    ]
+    if _run_failures:
+        lines.append("最终失败（没有上传任何证件）：")
+        width = max(len(wb) for wb, _, _ in _run_failures)
+        for waybill, name, reason in _run_failures:
+            lines.append(f"  {waybill.ljust(width)}  {name}  （{reason}）")
+    else:
+        lines.append("最终失败：无")
+    text = "\n".join(lines)
+    for line in lines:
+        logger.info(line)
+    err_log.write(text + "\n")
     err_log.flush()
 
 
@@ -1519,7 +1631,7 @@ async def process_one(
         if await id_link_loc.count() == 0:
             if await page.locator("text=请联系消费者完成实名认证").count() > 0:
                 return False, "no id"
-            return False, "请确认订单信息"
+            return False, CONFIRM_ORDER_INFO
 
         # 3 ── Open ID viewer page (Tab 1) ───────────────────────────────────
         id_page = await open_new_tab(ctx, page, SELECTORS["view_id_link"])
@@ -1673,6 +1785,17 @@ async def worker(
                 await human_sleep(0.4, 1.2)
                 continue
 
+            # "请确认订单信息": log it, then still try same-name / random placeholder.
+            if reason == CONFIRM_ORDER_INFO:
+                logger.warning(f"  {waybill}\t{display_name}\t{CONFIRM_ORDER_INFO} — trying upload anyway")
+                ok = await handle_no_id(
+                    ctx, waybill, display_name, name_index,
+                    placeholder_pool, err_log, uploads, reason=CONFIRM_ORDER_INFO,
+                )
+                results.append(ok)
+                await human_sleep(0.4, 1.2)
+                continue
+
             # HTTP 413: REST API rejected the payload; website upload often works.
             if is_api_413_after_retry(reason):
                 ok = await try_website_upload_today_or_yesterday(
@@ -1762,8 +1885,10 @@ async def run_from_log(log_path: Path) -> None:
             for waybill, name, reason in other_entries:
                 if is_successful_upload_note(reason):
                     write_match_note(err_log, waybill, name, reason)
+                    results.append(True)
                 else:
                     write_error(err_log, waybill, name, reason)
+                    results.append(False)
 
             for idx, (waybill, name) in enumerate(no_id_entries, 1):
                 logger.info(f"[{idx}/{len(no_id_entries)}]  {waybill}  ({name})")
@@ -1788,7 +1913,7 @@ async def run_from_log(log_path: Path) -> None:
                 logger.info(line)
             err_log.write(summary + "\n")
             write_placeholder_failure_summary(err_log, placeholder_pool)
-            err_log.flush()
+            write_run_summary(err_log, results)
 
         ok_count = sum(results)
         logger.info(
@@ -1914,7 +2039,7 @@ async def main() -> None:
                 logger.info(line)
             err_log.write(summary + "\n")
             write_placeholder_failure_summary(err_log, placeholder_pool)
-            err_log.flush()
+            write_run_summary(err_log, results)
 
         ok_count   = sum(results)
         fail_count = len(results) - ok_count

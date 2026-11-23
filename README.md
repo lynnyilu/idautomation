@@ -48,6 +48,7 @@ playwright install chromium
 | `CONCURRENCY` | `2` | How many Taobao orders are processed at the same time |
 | `OLD_FOLDER_MIN_AGE_DAYS` | `10` | Placeholder photos must come from a subfolder older than this, or from files sitting directly in `OUTPUT_DIR` |
 | `RANDOM_PLACEHOLDER_MAX_RETRIES` | `2` | Extra placeholder pairs to try after the first one fails (`no id - retried x times`) |
+| `SAME_NAME_MAX_RETRIES` | `2` | Extra attempts with the **same** same-name pair after the first upload fails |
 | `PLACEHOLDER_MAX_NAME_LEN` | `3` | Random placeholder pairs whose filename name is longer than this (e.g. `欧阳春晓`) are skipped |
 | `PLACEHOLDER_MIN_IDLE_DAYS` | `10` | Random placeholder skips a pair if it was website-uploaded within this many days |
 
@@ -104,14 +105,16 @@ Every waybill that doesn't go through the normal WMS API upload gets exactly **o
 
 **Unsuccessful waybills** (no ID uploaded in the end — unhandled API/timeout errors, `no id` after placeholder retries, same-name or 413 website upload still failing, `请确认订单信息`, etc.) are prefixed with `**` so they stand out and are easy to grep. Successful fallback uploads (`same name match uploaded successfully`, `no id, uploaded … - to be replaced later`) are **not** prefixed. After the duplicate-name summary, the log may also list placeholder files that failed during this run (`**<filename> has been tried and reported error: …`); those extra lines are not waybill rows.
 
+The very last block of each run is a summary: `=== 本次汇总：共 N 单 · 成功 X 单 · 失败 Y 单 ===`, followed by `最终失败（没有上传任何证件）：` and one line per waybill that ended with nothing uploaded (`<waybill>  <name>  （<reason>）`). 成功 counts any upload (WMS API, same-name match, or placeholder). These lines use spaces, not tabs, so `--from-log` ignores them. In `--from-log` mode the counts also include the lines carried over unchanged from the source log.
+
 | Reason | Meaning |
 |---|---|
 | `**…	no id` | Buyer hasn't completed identity verification, no same-name photo match was found, and there was no eligible old pair left to try as a placeholder |
 | `**…	no id - retried x times` | Same as above, but 1–3 random old pairs were tried (first attempt plus up to 2 retries) and all failed |
 | `no id, uploaded <name>(<folder>) - to be replaced later` | No same-name match; a random old pair (`<name>` from folder `<folder>`, e.g. `2026-04-23`) was uploaded as a placeholder (not `**`-prefixed) |
 | `same name match uploaded successfully` | Buyer hasn't completed verification, but a same-name photo match was found and the website-upload fallback succeeded (not `**`-prefixed) |
-| `**…	same name match fail to upload` | Same-name website upload failed — `**`-prefixed like every other unsuccessful waybill |
-| `**…	请确认订单信息` | Order not found or status unclear |
+| `**…	same name match fail to upload - retried 2 times` | Same-name website upload failed 3 times in a row with the same pair (first attempt plus `SAME_NAME_MAX_RETRIES` = 2 retries) — `**`-prefixed like every other unsuccessful waybill |
+| `…	请确认订单信息, …` | Order not found or status unclear. **Still goes through the `no id` fallback** (same-name match, then random placeholder), and every outcome line is prefixed with `请确认订单信息, ` — e.g. `请确认订单信息, same name match uploaded successfully`, `请确认订单信息, uploaded <name>(<folder>) - to be replaced later`, `**…	请确认订单信息, same name match fail to upload`, `**…	请确认订单信息 - retried x times`, or plain `**…	请确认订单信息` if no placeholder pair was left to try |
 | `**…	failed after retry: API upload failed: HTTP 413, …` | REST API rejected the images as too large, **and** the [website 413 fallback](#http-413-website-fallback) could not find today's/yesterday's photos or the website upload also failed. A successful 413 fallback writes **no** log line. |
 | `failed after retry: could not open ID viewer page` | ID viewer tab never opened after one retry. **Treated as `no id`** (same-name match, then random placeholder) — the log will show that flow's outcome, not this original text. |
 | `**…	failed after retry: ...` | Any other unexpected error after one automatic retry (timeout, other HTTP errors, etc.) — logged as-is with the `**` prefix, no extra upload |
@@ -128,7 +131,7 @@ The same flow also runs when Taobao never opened the ID viewer (`failed after re
 2. If **no** pair exists anywhere, fall through to the [random placeholder fallback](#random-placeholder-fallback-no-id-no-name-match) instead of giving up.
 3. If one or more pairs exist, **pick one at random** (deliberate — spreads reuse across candidates rather than always resubmitting the same photo for a repeat name). "found a same name match" is printed to the console at this point, but not written to the log file yet — see [Error log](#error-log).
 4. Upload that pair through `https://www.auodexpress.com/user.html#/upload-card-id`: upload front → upload back → click 开始识别身份证 (OCR) → fill in 运单号 with the waybill → click 确认提交.
-5. **One attempt only.** Any failure at any step (image rejected, OCR timeout/error, submit error) gives up on that waybill immediately and logs `**...same name match fail to upload` — no retry, no placeholder, no partial credit.
+5. **Up to 3 attempts with the same pair.** If any step fails (image rejected, OCR timeout/error, submit error), the same pair is retried up to `SAME_NAME_MAX_RETRIES` (2) more times. Each failed attempt writes an `upload error: … (attempt n/3)` detail line. If all 3 fail, it logs `**...same name match fail to upload - retried 2 times` — no placeholder fallback.
 
 This flow always runs **single-tab / sequential**, even while the normal Taobao workers run with `CONCURRENCY` in parallel — a deliberate scope decision to keep it easy to watch and debug while the flow is still being tuned, not a hard technical limit.
 
@@ -136,8 +139,8 @@ This flow always runs **single-tab / sequential**, even while the normal Taobao 
 
 Searching all ~40k+ files under `OUTPUT_DIR` from scratch on every lookup doesn't scale, so the name → photo-pairs index is cached on disk (`name_index_cache.json`, next to `automation.py`, gitignored) and built once at the start of every run:
 
-- Every dated subfolder is scanned **once**, ever — the cache treats past folders as immutable, which holds in normal use (photos only get added, never removed).
-- **Today's** subfolder is always rescanned each run, since it can still be actively growing.
+- Photos sitting **directly in `OUTPUT_DIR`** (~21k older files) are scanned on every run (not cached; well under a second).
+- Each subfolder, **including nested subfolders** (e.g. `2026-05-08\07MAY`), is cached and only rescanned when it is new, when it is **today's** folder, or when its folder modification time has changed (files added, removed or renamed since the last scan).
 - Folders that no longer exist on disk are dropped from the cache automatically.
 - If you ever reorganize or delete old photos and need a full rebuild, just delete `name_index_cache.json` — it'll be rebuilt (scanning everything once) on the next run.
 - If a cached pair is missing on disk when the script tries to use it (or while building the placeholder pool), that **one** pair is removed from `name_index_cache.json` and `photo_upload_history.json`. The waybill is still logged as a failure the same as before. You do not need to delete the whole cache for a few missing files.
